@@ -1,1 +1,3 @@
-
+<resources>
+    <string name="device_admin_description">ULTRA AI Device Administrator access is optional and can be revoked in Android Settings.</string>
+</resources>
