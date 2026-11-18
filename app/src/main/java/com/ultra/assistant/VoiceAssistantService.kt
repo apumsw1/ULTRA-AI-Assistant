@@ -21,8 +21,13 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import com.ultra.assistant.data.LocalSettingsRepository
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.Executors
 
 class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
@@ -30,31 +35,54 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_START = "com.ultra.assistant.START_VOICE"
         const val ACTION_STOP = "com.ultra.assistant.STOP_VOICE"
 
+        private const val AI_ENDPOINT =
+            "https://ultra-ai-assistant.ultraloader.workers.dev/api/voice"
+
         @Volatile
         var isRunning = false
             private set
     }
 
-    private enum class FollowUp { NONE, MUSIC_LANGUAGE }
+    private enum class FollowUp {
+        NONE,
+        MUSIC_LANGUAGE
+    }
+
+    private data class ChatTurn(
+        val role: String,
+        val content: String
+    )
 
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
+
     private var ttsReady = false
     private var listening = false
     private var speaking = false
     private var restarting = false
     private var destroyed = false
+    private var aiRequestInProgress = false
+
     private var followUp = FollowUp.NONE
 
     private val handler = Handler(Looper.getMainLooper())
 
+    private val networkExecutor = Executors.newSingleThreadExecutor()
+
+    // Recent conversation context. Kept only while the service is running.
+    private val conversationHistory = mutableListOf<ChatTurn>()
+
     override fun onCreate() {
         super.onCreate()
+
         destroyed = false
         isRunning = true
+
         createNotificationChannel()
         startForeground(31, createNotification())
+
         tts = TextToSpeech(this, this)
+
         setupRecognizer()
         startListening()
     }
@@ -64,17 +92,25 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         flags: Int,
         startId: Int
     ): Int {
+
         when (intent?.action) {
             ACTION_STOP -> {
                 stopVoiceService()
                 return START_NOT_STICKY
             }
+
             ACTION_START, null -> {
-                if (!listening && !speaking && isRunning) {
+                if (
+                    !listening &&
+                    !speaking &&
+                    !aiRequestInProgress &&
+                    isRunning
+                ) {
                     startListening()
                 }
             }
         }
+
         return START_STICKY
     }
 
@@ -86,6 +122,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
         tts?.setOnUtteranceProgressListener(
             object : UtteranceProgressListener() {
+
                 override fun onStart(id: String?) {}
 
                 override fun onDone(id: String?) {
@@ -112,6 +149,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun applyVoiceSettings() {
         val engine = tts ?: return
+
         engine.language = selectedLocale()
 
         val prefs = getSharedPreferences(
@@ -130,12 +168,15 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         )
 
         val voiceName = prefs.getString("voice_name", null)
+
         if (!voiceName.isNullOrBlank()) {
             engine.voices
                 ?.firstOrNull { it.name == voiceName }
                 ?.let { engine.voice = it }
         }
     }
+
+    // ---------------- SPEECH RECOGNITION ----------------
 
     private fun setupRecognizer() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) return
@@ -151,12 +192,14 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
                 override fun onReadyForSpeech(params: Bundle?) {
                     if (!isRunning) return
+
                     listening = true
                     sendVoiceState("LISTENING")
                 }
 
                 override fun onBeginningOfSpeech() {
                     if (!isRunning) return
+
                     listening = true
                     sendVoiceState("LISTENING")
                 }
@@ -169,27 +212,35 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
                 override fun onEndOfSpeech() {
                     if (!isRunning) return
+
                     listening = false
                     sendVoiceState("PROCESSING")
                 }
 
                 override fun onError(error: Int) {
                     if (!isRunning) return
+
                     listening = false
                     sendVoiceState("IDLE")
 
-                    if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                    if (
+                        error ==
+                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS
+                    ) {
                         stopVoiceService()
                     } else {
                         restartListening(
-                            if (error == SpeechRecognizer.ERROR_CLIENT) 1200L
-                            else 700L
+                            if (
+                                error ==
+                                SpeechRecognizer.ERROR_CLIENT
+                            ) 1200L else 700L
                         )
                     }
                 }
 
                 override fun onResults(results: Bundle?) {
                     if (!isRunning) return
+
                     listening = false
 
                     val spoken = results
@@ -225,34 +276,65 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                     }
                 }
 
-                override fun onEvent(eventType: Int, params: Bundle?) {}
+                override fun onEvent(
+                    eventType: Int,
+                    params: Bundle?
+                ) {}
             }
         )
     }
 
     private fun startListening() {
-        if (!isRunning || destroyed || speaking || listening) return
+        if (
+            !isRunning ||
+            destroyed ||
+            speaking ||
+            listening ||
+            aiRequestInProgress
+        ) return
+
         if (!SpeechRecognizer.isRecognitionAvailable(this)) return
 
-        if (recognizer == null) setupRecognizer()
+        if (recognizer == null) {
+            setupRecognizer()
+        }
 
         val language = selectedLanguageTag()
 
         val speechIntent = Intent(
             RecognizerIntent.ACTION_RECOGNIZE_SPEECH
         ).apply {
+
             putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
             )
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, language)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+
+            putExtra(
+                RecognizerIntent.EXTRA_LANGUAGE,
+                language
+            )
+
+            putExtra(
+                RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
+                language
+            )
+
+            putExtra(
+                RecognizerIntent.EXTRA_PARTIAL_RESULTS,
+                true
+            )
+
+            putExtra(
+                RecognizerIntent.EXTRA_MAX_RESULTS,
+                5
+            )
+
             putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
                 1200L
             )
+
             putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
                 900L
@@ -261,28 +343,53 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
         try {
             recognizer?.startListening(speechIntent)
+
             listening = true
             sendVoiceState("LISTENING")
+
         } catch (_: Exception) {
             listening = false
             restartListening(1200L)
         }
     }
 
+    // ---------------- COMMAND ROUTING ----------------
+
     private fun processCommand(rawText: String) {
         val command = rawText.trim()
+
         if (command.isBlank()) {
             restartListening(400L)
             return
         }
 
+        // Handle an active music-language follow-up locally.
         if (followUp == FollowUp.MUSIC_LANGUAGE) {
             followUp = FollowUp.NONE
 
             val language = when {
-                contains(command, "বাংলা", "bangla", "bengali") -> "Bengali"
-                contains(command, "হিন্দি", "hindi", "हिंदी", "हिन्दी") -> "Hindi"
-                contains(command, "ইংলিশ", "ইংরেজি", "english") -> "English"
+                contains(
+                    command,
+                    "বাংলা",
+                    "bangla",
+                    "bengali"
+                ) -> "Bengali"
+
+                contains(
+                    command,
+                    "হিন্দি",
+                    "hindi",
+                    "हिंदी",
+                    "हिन्दी"
+                ) -> "Hindi"
+
+                contains(
+                    command,
+                    "ইংলিশ",
+                    "ইংরেজি",
+                    "english"
+                ) -> "English"
+
                 else -> ""
             }
 
@@ -290,33 +397,47 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 openMusicSearch("$language songs")
             } else {
                 followUp = FollowUp.MUSIC_LANGUAGE
+
                 speak(
                     "I didn't catch that. Would you like Bengali, Hindi, or English songs?"
                 )
             }
+
             return
         }
 
+        // Local device commands have priority over online AI.
         when {
+
             isWifiCommand(command) -> {
                 openInternetSettings()
-                speak("Opening internet settings. You can change Wi-Fi there.")
+
+                speak(
+                    "Opening internet settings. You can change Wi-Fi there."
+                )
             }
 
             isBluetoothCommand(command) -> {
-                openSettingsSafely(Settings.ACTION_BLUETOOTH_SETTINGS)
+                openSettingsSafely(
+                    Settings.ACTION_BLUETOOTH_SETTINGS
+                )
+
                 speak("Opening Bluetooth settings.")
             }
 
             isGeneralSettingsCommand(command) -> {
                 openSettingsSafely(Settings.ACTION_SETTINGS)
+
                 speak("Opening settings.")
             }
 
             isExplicitSearch(command) -> {
                 val query = removeSearchPrefix(command)
+
                 if (query.isBlank()) {
-                    speak("What would you like me to search for?")
+                    speak(
+                        "What would you like me to search for?"
+                    )
                 } else {
                     openExplicitWebSearch(query)
                 }
@@ -324,17 +445,37 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
             isMusicRequest(command) -> {
                 when {
-                    contains(command, "হিন্দি", "hindi", "हिंदी") ->
+
+                    contains(
+                        command,
+                        "হিন্দি",
+                        "hindi",
+                        "हिंदी"
+                    ) -> {
                         openMusicSearch("Hindi songs")
+                    }
 
-                    contains(command, "বাংলা", "bangla", "bengali") ->
+                    contains(
+                        command,
+                        "বাংলা",
+                        "bangla",
+                        "bengali"
+                    ) -> {
                         openMusicSearch("Bengali songs")
+                    }
 
-                    contains(command, "english", "ইংলিশ", "ইংরেজি") ->
+                    contains(
+                        command,
+                        "english",
+                        "ইংলিশ",
+                        "ইংরেজি"
+                    ) -> {
                         openMusicSearch("English songs")
+                    }
 
                     else -> {
                         followUp = FollowUp.MUSIC_LANGUAGE
+
                         speak(
                             "Of course. What kind of songs would you like: Bengali, Hindi, or English?"
                         )
@@ -355,35 +496,206 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 }
             }
 
-            contains(command, "hello", "হ্যালো", "नमस्ते", "নমস্কার") -> {
-                speak("Hello. I'm here. What would you like to do?")
-            }
-
-            contains(command, "what do you mean", "মানে কি", "তুমি কি বলতে চাচ্ছ") -> {
-                speak(
-                    "I mean I couldn't identify that clearly. Tell me what you want to do, and I'll try again."
-                )
-            }
-
+            // Everything else goes to the ULTRA AI Worker.
             else -> {
-                speak(
-                    "I'm not sure I understood that. Could you say it another way?"
-                )
+                requestAiReply(command)
             }
         }
     }
 
+    // ---------------- ONLINE AI CONNECTION ----------------
+
+    private fun requestAiReply(message: String) {
+        if (!isRunning || destroyed) return
+
+        if (message.length > 3000) {
+            speak("That message is too long. Please try a shorter sentence.")
+            return
+        }
+
+        if (aiRequestInProgress) return
+
+        aiRequestInProgress = true
+        listening = false
+
+        sendVoiceState("PROCESSING")
+
+        // Take a safe snapshot before moving work to the background thread.
+        val historySnapshot = conversationHistory.toList()
+
+        networkExecutor.execute {
+
+            var answer: String? = null
+            var errorMessage: String? = null
+
+            var connection: HttpURLConnection? = null
+
+            try {
+                connection = (
+                    URL(AI_ENDPOINT).openConnection()
+                    ) as HttpURLConnection
+
+                connection.requestMethod = "POST"
+                connection.connectTimeout = 15000
+                connection.readTimeout = 30000
+                connection.doOutput = true
+
+                connection.setRequestProperty(
+                    "Content-Type",
+                    "application/json; charset=utf-8"
+                )
+
+                connection.setRequestProperty(
+                    "Accept",
+                    "application/json"
+                )
+
+                // Previous conversation turns.
+                val historyJson = JSONArray()
+
+                historySnapshot.takeLast(8).forEach { turn ->
+                    historyJson.put(
+                        JSONObject()
+                            .put("role", turn.role)
+                            .put("content", turn.content)
+                    )
+                }
+
+                val requestBody = JSONObject()
+                    .put("message", message)
+                    .put("history", historyJson)
+                    .toString()
+
+                connection.outputStream.use { output ->
+                    output.write(
+                        requestBody.toByteArray(Charsets.UTF_8)
+                    )
+                    output.flush()
+                }
+
+                val statusCode = connection.responseCode
+
+                val responseStream = if (
+                    statusCode in 200..299
+                ) {
+                    connection.inputStream
+                } else {
+                    connection.errorStream
+                }
+
+                val responseText = responseStream
+                    ?.bufferedReader(Charsets.UTF_8)
+                    ?.use { it.readText() }
+                    .orEmpty()
+
+                if (statusCode !in 200..299) {
+                    throw IllegalStateException(
+                        "Worker HTTP $statusCode"
+                    )
+                }
+
+                val json = JSONObject(responseText)
+
+                if (!json.optBoolean("ok", false)) {
+                    throw IllegalStateException(
+                        json.optString(
+                            "error",
+                            "AI request failed"
+                        )
+                    )
+                }
+
+                answer = json
+                    .optString("reply", "")
+                    .trim()
+
+                if (answer.isNullOrBlank()) {
+                    throw IllegalStateException(
+                        "AI returned an empty reply"
+                    )
+                }
+
+            } catch (exception: Exception) {
+                errorMessage = exception.message
+
+            } finally {
+                connection?.disconnect()
+            }
+
+            val finalAnswer = answer
+            val finalError = errorMessage
+
+            handler.post {
+
+                aiRequestInProgress = false
+
+                if (!isRunning || destroyed) return@post
+
+                if (!finalAnswer.isNullOrBlank()) {
+
+                    // Store only successful exchanges.
+                    conversationHistory.add(
+                        ChatTurn("user", message)
+                    )
+
+                    conversationHistory.add(
+                        ChatTurn("assistant", finalAnswer)
+                    )
+
+                    // Keep the latest 8 messages.
+                    while (conversationHistory.size > 8) {
+                        conversationHistory.removeAt(0)
+                    }
+
+                    speak(finalAnswer)
+
+                } else {
+                    sendVoiceState("IDLE")
+
+                    val fallback = when (selectedLanguageTag()) {
+                        "bn-IN" ->
+                            "দুঃখিত, এখন অনলাইন AI-এর সঙ্গে সংযোগ হচ্ছে না। ইন্টারনেট সংযোগ পরীক্ষা করে আবার বলুন।"
+
+                        "hi-IN" ->
+                            "माफ़ कीजिए, अभी ऑनलाइन AI से कनेक्ट नहीं हो पा रहा है। इंटरनेट कनेक्शन जाँचकर फिर कोशिश करें।"
+
+                        else ->
+                            "I'm having trouble reaching online AI right now. Please check your internet connection and try again."
+                    }
+
+                    speak(fallback)
+
+                    android.util.Log.w(
+                        "ULTRA_AI",
+                        "AI request failed: $finalError"
+                    )
+                }
+            }
+        }
+    }
+
+    // ---------------- WIFI / BLUETOOTH / SETTINGS ----------------
+
     private fun isWifiCommand(text: String): Boolean {
         val wifi = contains(
             text,
-            "wifi", "wi-fi", "ওয়াইফাই", "ওয়াইফাই",
-            "ওয়াই ফাই", "ওয়াই ফাই"
+            "wifi",
+            "wi-fi",
+            "ওয়াইফাই",
+            "ওয়াইফাই",
+            "ওয়াই ফাই",
+            "ওয়াই ফাই"
         )
 
         val action = contains(
             text,
-            "বন্ধ", "off", "চালু", "অন", "on",
-            "খোলো", "খুলে"
+            "বন্ধ",
+            "off",
+            "চালু",
+            "অন",
+            "on",
+            "খোলো",
+            "খুলে"
         )
 
         return wifi && action
@@ -408,48 +720,81 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         contains(text, "bluetooth", "ব্লুটুথ") &&
             contains(
                 text,
-                "settings", "সেটিং", "বন্ধ",
-                "চালু", "off", "on", "খোলো"
+                "settings",
+                "সেটিং",
+                "বন্ধ",
+                "চালু",
+                "off",
+                "on",
+                "খোলো"
             )
 
     private fun isGeneralSettingsCommand(text: String): Boolean =
         contains(
             text,
-            "settings", "সেটিংস", "সেটিংসে", "सेटिंग", "सेटिंग्स"
+            "settings",
+            "সেটিংস",
+            "সেটিংসে",
+            "सेटिंग",
+            "सेटिंग्स"
         ) &&
             !contains(
                 text,
-                "wifi", "wi-fi", "ওয়াইফাই",
-                "ওয়াইফাই", "bluetooth", "ব্লুটুথ"
+                "wifi",
+                "wi-fi",
+                "ওয়াইফাই",
+                "ওয়াইফাই",
+                "bluetooth",
+                "ব্লুটুথ"
             )
 
     private fun openSettingsSafely(action: String) {
         try {
             startActivity(
-                Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                Intent(action)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         } catch (_: Exception) {
-            speak("I couldn't open that settings page on this device.")
+            speak(
+                "I couldn't open that settings page on this device."
+            )
         }
     }
+
+    // ---------------- EXPLICIT WEB SEARCH ----------------
 
     private fun isExplicitSearch(text: String): Boolean =
         contains(
             text,
-            "search for ", "search ", "google ",
-            "সার্চ কর", "সার্চ ", "খুঁজে দেখ",
-            "খোঁজ কর", "सर्च करो", "खोजो "
+            "search for ",
+            "search ",
+            "google ",
+            "সার্চ কর",
+            "সার্চ ",
+            "খুঁজে দেখ",
+            "খোঁজ কর",
+            "सर्च करो",
+            "खोजो "
         )
 
     private fun removeSearchPrefix(text: String): String {
         val prefixes = listOf(
-            "search for ", "search ", "google ",
-            "সার্চ করে ", "সার্চ করো ", "সার্চ কর ",
-            "সার্চ ", "খুঁজে দেখ ", "খোঁজ কর ",
-            "सर्च करो ", "सर्च ", "खोजो "
+            "search for ",
+            "search ",
+            "google ",
+            "সার্চ করে ",
+            "সার্চ করো ",
+            "সার্চ কর ",
+            "সার্চ ",
+            "খুঁজে দেখ ",
+            "খোঁজ কর ",
+            "सर्च करो ",
+            "सर्च ",
+            "खोजो "
         )
 
         val value = text.trim()
+
         val prefix = prefixes.firstOrNull {
             value.startsWith(it, ignoreCase = true)
         }
@@ -459,47 +804,103 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         } ?: value
     }
 
+    private fun openExplicitWebSearch(query: String) {
+        try {
+            val url =
+                "https://www.google.com/search?q=" + encode(query)
+
+            startActivity(
+                Intent(
+                    Intent.ACTION_VIEW,
+                    Uri.parse(url)
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+
+            speak("Searching for $query.")
+
+        } catch (_: Exception) {
+            speak(
+                "I couldn't open a browser to search for that."
+            )
+        }
+    }
+
+    // ---------------- MUSIC ----------------
+
     private fun isMusicRequest(text: String): Boolean =
         contains(
             text,
-            "গান", "music", "song", "songs",
-            "গান শোনাও", "গান বাজাও"
+            "গান",
+            "music",
+            "song",
+            "songs",
+            "গান শোনাও",
+            "গান বাজাও"
         )
 
     private fun openMusicSearch(query: String) {
         try {
-            val url = "https://music.youtube.com/search?q=" + encode(query)
+            val url =
+                "https://music.youtube.com/search?q=" + encode(query)
+
             startActivity(
-                Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                Intent(
+                    Intent.ACTION_VIEW,
+                    Uri.parse(url)
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
+
             speak("Okay. Here are the $query.")
+
         } catch (_: Exception) {
-            speak("I couldn't open a music app on this phone.")
+            speak(
+                "I couldn't open a music app on this phone."
+            )
         }
     }
+
+    // ---------------- APP LAUNCHING ----------------
 
     private fun isAppLaunchRequest(text: String): Boolean =
         contains(
             text,
-            "open ", "launch ", "start ",
-            "খোলো", "খুলে দাও", "চালু কর",
-            "অ্যাপ খোলো", "खोलो", "ऐप खोलो", "चालू करो"
+            "open ",
+            "launch ",
+            "start ",
+            "খোলো",
+            "খুলে দাও",
+            "চালু কর",
+            "অ্যাপ খোলো",
+            "खोलो",
+            "ऐप खोलो",
+            "चालू करो"
         )
 
     private fun cleanAppQuery(command: String): String {
         var value = command.trim()
 
         val prefixes = listOf(
-            "open the app ", "launch the app ", "start the app ",
-            "open ", "launch ", "start ", "run ",
-            "অ্যাপ খোলো ", "খুলে দাও ", "খোলো ",
-            "চালু কর ", "ऐप खोलो ", "खोलो ", "चालू करो "
+            "open the app ",
+            "launch the app ",
+            "start the app ",
+            "open ",
+            "launch ",
+            "start ",
+            "run ",
+            "অ্যাপ খোলো ",
+            "খুলে দাও ",
+            "খোলো ",
+            "চালু কর ",
+            "ऐप खोलो ",
+            "खोलो ",
+            "चालू करो "
         )
 
         var changed = true
+
         while (changed) {
             changed = false
+
             val prefix = prefixes.firstOrNull {
                 value.startsWith(it, ignoreCase = true)
             }
@@ -511,9 +912,14 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
 
         val suffixes = listOf(
-            " অ্যাপ খোলো", " অ্যাপ চালু করো",
-            " অ্যাপ", " app", " খুলে দাও",
-            " খোলো", " চালু করো", " চালাও"
+            " অ্যাপ খোলো",
+            " অ্যাপ চালু করো",
+            " অ্যাপ",
+            " app",
+            " খুলে দাও",
+            " খোলো",
+            " চালু করো",
+            " চালাও"
         )
 
         val suffix = suffixes.firstOrNull {
@@ -527,27 +933,38 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         return value
     }
 
-    private fun findApplication(queryText: String): ResolveInfo? {
+    private fun findApplication(
+        queryText: String
+    ): ResolveInfo? {
+
         val query = normalize(queryText)
+
         if (query.length < 2) return null
 
         val launcher = Intent(Intent.ACTION_MAIN)
             .addCategory(Intent.CATEGORY_LAUNCHER)
 
-        val apps = packageManager.queryIntentActivities(launcher, 0)
+        val apps = packageManager.queryIntentActivities(
+            launcher,
+            0
+        )
 
         var best: ResolveInfo? = null
         var bestScore = 0
 
         for (app in apps) {
-            val label = app.loadLabel(packageManager)?.toString().orEmpty()
+            val label = app.loadLabel(packageManager)
+                ?.toString()
+                .orEmpty()
+
             val normalized = normalize(label)
 
             val score = when {
                 normalized == query -> 1000
                 normalized.startsWith(query) -> 850
                 normalized.contains(query) -> 750
-                query.contains(normalized) && normalized.length >= 4 -> 650
+                query.contains(normalized) &&
+                    normalized.length >= 4 -> 650
                 else -> 0
             }
 
@@ -566,36 +983,34 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
-        val label = info.loadLabel(packageManager)?.toString().orEmpty()
+        val label = info.loadLabel(packageManager)
+            ?.toString()
+            .orEmpty()
 
         try {
             val intent = Intent(Intent.ACTION_MAIN)
                 .addCategory(Intent.CATEGORY_LAUNCHER)
-                .setClassName(activity.packageName, activity.name)
+                .setClassName(
+                    activity.packageName,
+                    activity.name
+                )
                 .addFlags(
                     Intent.FLAG_ACTIVITY_NEW_TASK or
                         Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
                 )
 
             startActivity(intent)
-            speak("Opening $label. What would you like to do?")
+
+            speak(
+                "Opening $label. What would you like to do?"
+            )
+
         } catch (_: Exception) {
             speak("I couldn't open $label.")
         }
     }
 
-    private fun openExplicitWebSearch(query: String) {
-        try {
-            val url = "https://www.google.com/search?q=" + encode(query)
-            startActivity(
-                Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-            speak("Searching for $query.")
-        } catch (_: Exception) {
-            speak("I couldn't open a browser to search for that.")
-        }
-    }
+    // ---------------- LANGUAGE / TEXT HELPERS ----------------
 
     private fun normalize(value: String): String =
         value.lowercase(Locale.ROOT)
@@ -610,9 +1025,19 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             .trim()
 
         return when (value) {
-            "hindi", "hi", "hi-in", "हिन्दी", "हिंदी" -> "hi-IN"
-            "bengali", "bangla", "bn", "bn-in", "বাংলা",
+            "hindi",
+            "hi",
+            "hi-in",
+            "हिन्दी",
+            "हिंदी" -> "hi-IN"
+
+            "bengali",
+            "bangla",
+            "bn",
+            "bn-in",
+            "বাংলা",
             "indian bengali" -> "bn-IN"
+
             else -> "en-IN"
         }
     }
@@ -624,6 +1049,19 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             else -> Locale("en", "IN")
         }
 
+    private fun contains(
+        text: String,
+        vararg words: String
+    ): Boolean =
+        words.any {
+            text.contains(it, ignoreCase = true)
+        }
+
+    private fun encode(text: String): String =
+        URLEncoder.encode(text, "UTF-8")
+
+    // ---------------- TEXT TO SPEECH ----------------
+
     private fun speak(message: String) {
         if (!isRunning) return
 
@@ -634,10 +1072,12 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
 
         applyVoiceSettings()
+
         speaking = true
         sendVoiceState("SPEAKING")
 
         val id = "ultra_" + System.currentTimeMillis()
+
         tts?.speak(
             message,
             TextToSpeech.QUEUE_FLUSH,
@@ -648,32 +1088,47 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun finishSpeaking() {
         if (!isRunning || destroyed) return
+
         speaking = false
+
         sendVoiceState("IDLE")
         restartListening(350L)
     }
 
-    private fun contains(text: String, vararg words: String): Boolean =
-        words.any { text.contains(it, ignoreCase = true) }
-
-    private fun encode(text: String): String =
-        URLEncoder.encode(text, "UTF-8")
+    // ---------------- LISTENING RESTART ----------------
 
     private fun restartListening(delay: Long) {
-        if (!isRunning || destroyed || restarting) return
+        if (
+            !isRunning ||
+            destroyed ||
+            restarting ||
+            aiRequestInProgress
+        ) return
 
         restarting = true
 
         handler.postDelayed({
+
             restarting = false
-            if (isRunning && !destroyed && !speaking && !listening) {
+
+            if (
+                isRunning &&
+                !destroyed &&
+                !speaking &&
+                !listening &&
+                !aiRequestInProgress
+            ) {
                 startListening()
             }
+
         }, delay)
     }
 
+    // ---------------- UI BROADCASTS ----------------
+
     private fun sendVoiceState(state: String) {
         if (!isRunning) return
+
         sendBroadcast(
             Intent("com.ultra.assistant.VOICE_STATE")
                 .putExtra("state", state)
@@ -682,6 +1137,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun sendRecognizedText(text: String) {
         if (!isRunning) return
+
         sendBroadcast(
             Intent("com.ultra.assistant.VOICE_TEXT")
                 .putExtra("text", text)
@@ -690,6 +1146,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun sendPartialText(text: String) {
         if (!isRunning) return
+
         sendBroadcast(
             Intent("com.ultra.assistant.VOICE_PARTIAL")
                 .putExtra("text", text)
@@ -698,14 +1155,18 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun sendVoiceLevel(level: Float) {
         if (!isRunning) return
+
         sendBroadcast(
             Intent("com.ultra.assistant.VOICE_LEVEL")
                 .putExtra("level", level)
         )
     }
 
+    // ---------------- NOTIFICATION ----------------
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
             val channel = NotificationChannel(
                 "ultra_assistant",
                 "ULTRA AI Assistant",
@@ -717,8 +1178,9 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 setShowBadge(false)
             }
 
-            getSystemService(NotificationManager::class.java)
-                .createNotificationChannel(channel)
+            getSystemService(
+                NotificationManager::class.java
+            ).createNotificationChannel(channel)
         }
     }
 
@@ -731,7 +1193,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 PendingIntent.FLAG_IMMUTABLE
         )
 
-        return NotificationCompat.Builder(this, "ultra_assistant")
+        return NotificationCompat.Builder(
+            this,
+            "ultra_assistant"
+        )
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle("ULTRA AI Assistant")
             .setContentText("Voice assistant is active")
@@ -742,10 +1207,14 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             .build()
     }
 
+    // ---------------- STOP / DESTROY ----------------
+
     private fun stopVoiceService() {
         isRunning = false
         destroyed = true
+
         handler.removeCallbacksAndMessages(null)
+        networkExecutor.shutdownNow()
 
         runCatching {
             recognizer?.cancel()
@@ -764,6 +1233,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         listening = false
         speaking = false
         restarting = false
+        aiRequestInProgress = false
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -778,7 +1248,9 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         isRunning = false
         destroyed = true
+
         handler.removeCallbacksAndMessages(null)
+        networkExecutor.shutdownNow()
 
         runCatching {
             recognizer?.cancel()
@@ -797,6 +1269,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         listening = false
         speaking = false
         restarting = false
+        aiRequestInProgress = false
 
         super.onDestroy()
     }
