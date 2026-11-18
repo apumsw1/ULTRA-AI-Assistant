@@ -1,4 +1,3 @@
-
 package com.ultra.assistant
 
 import android.app.Notification
