@@ -21,10 +21,7 @@ export default {
     }
 
     if (url.pathname === "/health" && request.method === "GET") {
-      return reply({
-        ok: true,
-        service: "ULTRA AI Voice"
-      });
+      return reply({ ok: true, service: "ULTRA AI Voice" });
     }
 
     if (url.pathname !== "/api/voice" || request.method !== "POST") {
@@ -32,6 +29,7 @@ export default {
     }
 
     if (!env.OPENAI_API_KEY) {
+      console.error("Configuration error: OPENAI_API_KEY is missing");
       return reply({
         ok: false,
         error: "AI API key is not configured"
@@ -81,17 +79,11 @@ export default {
           body: JSON.stringify({
             model: env.OPENAI_MODEL || "gpt-4o-mini",
             instructions:
-              "You are ULTRA, an advanced multilingual voice assistant " +
-              "designed primarily to help users control their Android phones. " +
-              "You are not a general ChatGPT clone. " +
-              "Understand Bengali, Hindi and English. " +
-              "Reply in the same language as the user. " +
-              "Understand conversation context and follow-up answers. " +
-              "Ask a short clarification when a command is ambiguous. " +
-              "Be natural, warm and concise for spoken responses. " +
+              "You are ULTRA, a multilingual Android voice assistant. " +
+              "Understand Bengali, Hindi and English. Reply in the same " +
+              "language as the user. Be natural, warm and concise. " +
               "Never claim you performed a phone action. " +
-              "Actual device actions are executed by the Android app " +
-              "only after local permission and safety checks. " +
+              "Actual device actions are handled by the Android app. " +
               "Do not use Markdown in normal spoken replies.",
             input: [
               ...history,
@@ -103,13 +95,35 @@ export default {
         }
       );
 
-      const result = await response.json();
+      const raw = await response.text();
+
+      let result = {};
+      try {
+        result = JSON.parse(raw);
+      } catch {
+        result = {};
+      }
 
       if (!response.ok) {
+        const providerError =
+          result?.error?.message || "Unknown OpenAI API error";
+        const providerCode = result?.error?.code || null;
+        const providerType = result?.error?.type || null;
+
+        console.error("OpenAI API request failed", {
+          status: response.status,
+          code: providerCode,
+          type: providerType,
+          message: providerError,
+          requestId: response.headers.get("x-request-id")
+        });
+
         return reply({
           ok: false,
-          error: "AI provider request failed",
-          status: response.status
+          error: "OpenAI API request failed",
+          provider_status: response.status,
+          provider_code: providerCode,
+          provider_message: String(providerError).slice(0, 500)
         }, 502);
       }
 
@@ -128,6 +142,11 @@ export default {
       answer = answer.trim();
 
       if (!answer) {
+        console.error("OpenAI returned an empty response", {
+          responseId: result.id || null,
+          status: result.status || null
+        });
+
         return reply({
           ok: false,
           error: "Empty AI response"
@@ -139,10 +158,15 @@ export default {
         reply: answer
       });
 
-    } catch {
+    } catch (error) {
+      console.error("AI fetch exception", {
+        name: error?.name || "Error",
+        message: error?.message || "Unknown fetch error"
+      });
+
       return reply({
         ok: false,
-        error: "AI service unavailable"
+        error: "AI service connection failed"
       }, 502);
     }
   }
