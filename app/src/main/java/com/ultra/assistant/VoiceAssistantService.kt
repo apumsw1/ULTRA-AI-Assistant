@@ -77,7 +77,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
             ACTION_START,
             null -> {
-                if (!listening && !speaking) {
+                if (!listening && !speaking && isRunning) {
                     startListening()
                 }
             }
@@ -117,11 +117,15 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 override fun onReadyForSpeech(
                     params: Bundle?
                 ) {
+                    if (!isRunning) return
+
                     listening = true
                     sendVoiceState("LISTENING")
                 }
 
                 override fun onBeginningOfSpeech() {
+                    if (!isRunning) return
+
                     listening = true
                     sendVoiceState("LISTENING")
                 }
@@ -129,6 +133,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 override fun onRmsChanged(
                     rmsdB: Float
                 ) {
+                    if (!isRunning) return
+
                     sendVoiceLevel(rmsdB)
                 }
 
@@ -138,6 +144,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 }
 
                 override fun onEndOfSpeech() {
+                    if (!isRunning) return
+
                     listening = false
                     sendVoiceState("PROCESSING")
                 }
@@ -145,6 +153,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 override fun onError(
                     error: Int
                 ) {
+
+                    if (!isRunning) return
 
                     listening = false
                     sendVoiceState("IDLE")
@@ -168,6 +178,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 override fun onResults(
                     results: Bundle?
                 ) {
+
+                    if (!isRunning) return
 
                     listening = false
 
@@ -196,6 +208,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                     partialResults: Bundle?
                 ) {
 
+                    if (!isRunning) return
+
                     val list =
                         partialResults?.getStringArrayList(
                             SpeechRecognizer.RESULTS_RECOGNITION
@@ -222,6 +236,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun startListening() {
+
+        if (!isRunning) {
+            return
+        }
 
         if (speaking || listening) {
             return
@@ -399,9 +417,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         val normalizedQuery =
             normalize(query)
 
-        var best:
-                ResolveInfo? = null
-
+        var best: ResolveInfo? = null
         var bestScore = 0
 
         for (app in apps) {
@@ -775,6 +791,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         hindi: String
     ) {
 
+        if (!isRunning) {
+            return
+        }
+
         if (!ttsReady) {
             restartListening(700)
             return
@@ -815,6 +835,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
         handler.postDelayed(
             {
+                if (!isRunning) return@postDelayed
+
                 speaking = false
                 sendVoiceState("IDLE")
                 restartListening(350)
@@ -940,8 +962,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     ) {
 
         if (
-            restarting ||
-            isDestroyed
+            !isRunning ||
+            restarting
         ) {
             return
         }
@@ -954,7 +976,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 restarting = false
 
                 if (
-                    !isDestroyed &&
+                    isRunning &&
                     !speaking &&
                     !listening
                 ) {
@@ -969,6 +991,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     private fun sendVoiceState(
         state: String
     ) {
+
+        if (!isRunning) {
+            return
+        }
 
         sendBroadcast(
             Intent(
@@ -987,6 +1013,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         text: String
     ) {
 
+        if (!isRunning) {
+            return
+        }
+
         sendBroadcast(
             Intent(
                 "com.ultra.assistant.VOICE_TEXT"
@@ -1004,6 +1034,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         text: String
     ) {
 
+        if (!isRunning) {
+            return
+        }
+
         sendBroadcast(
             Intent(
                 "com.ultra.assistant.VOICE_PARTIAL"
@@ -1020,6 +1054,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     private fun sendVoiceLevel(
         level: Float
     ) {
+
+        if (!isRunning) {
+            return
+        }
 
         sendBroadcast(
             Intent(
@@ -1095,6 +1133,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun stopVoiceService() {
 
+        isRunning = false
+
+        handler.removeCallbacksAndMessages(null)
+
         try {
             recognizer?.cancel()
             recognizer?.destroy()
@@ -1111,18 +1153,26 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
         tts = null
 
+        ttsReady = false
         listening = false
         speaking = false
-        isRunning = false
+        restarting = false
 
-        stopForeground(
-            STOP_FOREGROUND_REMOVE
-        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(
+                STOP_FOREGROUND_REMOVE
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
 
         stopSelf()
     }
 
     override fun onDestroy() {
+
+        isRunning = false
 
         handler.removeCallbacksAndMessages(
             null
@@ -1144,9 +1194,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
         tts = null
 
+        ttsReady = false
         listening = false
         speaking = false
-        isRunning = false
+        restarting = false
 
         super.onDestroy()
     }
