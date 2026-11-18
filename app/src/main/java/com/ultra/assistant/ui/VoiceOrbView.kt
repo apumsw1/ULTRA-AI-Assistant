@@ -29,16 +29,12 @@ class VoiceOrbView(context: Context) : View(context) {
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val particlePaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-    private val particleAngles = FloatArray(24) { index ->
-        index * 15f
+    private val particleAngles = FloatArray(24) { it * 15f }
+    private val particleSpeeds = FloatArray(24) {
+        0.35f + (it % 4) * 0.08f
     }
-
-    private val particleSpeeds = FloatArray(24) { index ->
-        0.35f + (index % 4) * 0.08f
-    }
-
-    private val particleSizes = FloatArray(24) { index ->
-        2f + (index % 3)
+    private val particleSizes = FloatArray(24) {
+        2f + (it % 3)
     }
 
     init {
@@ -55,16 +51,13 @@ class VoiceOrbView(context: Context) : View(context) {
         invalidate()
     }
 
-    fun getState(): State {
-        return state
-    }
+    fun getState(): State = state
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
         if (!enabled) {
             drawDisabled(canvas)
-            postInvalidateDelayed(100)
             return
         }
 
@@ -75,59 +68,21 @@ class VoiceOrbView(context: Context) : View(context) {
         val baseRadius = minOf(width, height) * 0.15f
 
         val pulse = when (state) {
-            State.IDLE ->
-                1f + 0.015f * sin(frame * 0.04f)
-
-            State.LISTENING ->
-                1f + 0.08f * sin(frame * 0.15f)
-
-            State.PROCESSING ->
-                1f + 0.05f * sin(frame * 0.25f)
-
-            State.SPEAKING ->
-                1f + 0.10f * sin(frame * 0.20f)
-
-            State.OFFLINE ->
-                1f + 0.02f * sin(frame * 0.06f)
+            State.IDLE -> 1f + 0.015f * sin(frame * 0.04f)
+            State.LISTENING -> 1f + 0.08f * sin(frame * 0.15f)
+            State.PROCESSING -> 1f + 0.05f * sin(frame * 0.25f)
+            State.SPEAKING -> 1f + 0.10f * sin(frame * 0.20f)
+            State.OFFLINE -> 1f + 0.02f * sin(frame * 0.06f)
         }
 
         val radius = baseRadius * pulse
-
         val primary = primaryColor()
         val secondary = secondaryColor()
 
-        drawGlow(
-            canvas,
-            centerX,
-            centerY,
-            radius,
-            primary
-        )
-
-        drawParticles(
-            canvas,
-            centerX,
-            centerY,
-            radius,
-            secondary
-        )
-
-        drawRings(
-            canvas,
-            centerX,
-            centerY,
-            radius,
-            secondary
-        )
-
-        drawOrb(
-            canvas,
-            centerX,
-            centerY,
-            radius,
-            primary,
-            secondary
-        )
+        drawGlow(canvas, centerX, centerY, radius, primary)
+        drawParticles(canvas, centerX, centerY, radius, secondary)
+        drawRings(canvas, centerX, centerY, radius, secondary)
+        drawOrb(canvas, centerX, centerY, radius, primary, secondary)
 
         postInvalidateDelayed(16)
     }
@@ -151,12 +106,7 @@ class VoiceOrbView(context: Context) : View(context) {
                 withAlpha(color, 8),
                 Color.TRANSPARENT
             ),
-            floatArrayOf(
-                0f,
-                0.4f,
-                0.75f,
-                1f
-            ),
+            floatArrayOf(0f, 0.4f, 0.75f, 1f),
             Shader.TileMode.CLAMP
         )
 
@@ -188,12 +138,7 @@ class VoiceOrbView(context: Context) : View(context) {
                 secondary,
                 Color.rgb(8, 14, 28)
             ),
-            floatArrayOf(
-                0f,
-                0.25f,
-                0.68f,
-                1f
-            ),
+            floatArrayOf(0f, 0.25f, 0.68f, 1f),
             Shader.TileMode.CLAMP
         )
 
@@ -205,11 +150,7 @@ class VoiceOrbView(context: Context) : View(context) {
         )
 
         orbPaint.shader = null
-
-        orbPaint.color = withAlpha(
-            Color.WHITE,
-            105
-        )
+        orbPaint.color = withAlpha(Color.WHITE, 105)
 
         canvas.drawCircle(
             centerX - radius * 0.30f,
@@ -241,15 +182,13 @@ class VoiceOrbView(context: Context) : View(context) {
                 radius * (1.45f + index * 0.32f)
 
             ringPaint.style = Paint.Style.STROKE
-
             ringPaint.strokeWidth =
                 if (index == 0) 2.2f else 1.1f
 
-            ringPaint.color =
-                withAlpha(
-                    color,
-                    (180 - index * 35).coerceIn(35, 200)
-                )
+            ringPaint.color = withAlpha(
+                color,
+                (180 - index * 35).coerceIn(35, 200)
+            )
 
             canvas.drawArc(
                 centerX - ringRadius,
@@ -284,9 +223,10 @@ class VoiceOrbView(context: Context) : View(context) {
         for (index in particleAngles.indices) {
             particleAngles[index] += particleSpeeds[index]
 
-            val radians = Math.toRadians(
-                particleAngles[index].toDouble()
-            )
+            val radians =
+                Math.toRadians(
+                    particleAngles[index].toDouble()
+                )
 
             val distance =
                 radius *
@@ -314,11 +254,11 @@ class VoiceOrbView(context: Context) : View(context) {
                         ) / 2f
                     )
 
-            particlePaint.color =
-                withAlpha(
-                    color,
-                    (70 + index % 5 * 25).coerceIn(60, 190)
-                )
+            particlePaint.color = withAlpha(
+                color,
+                (70 + index % 5 * 25)
+                    .coerceIn(60, 190)
+            )
 
             canvas.drawCircle(
                 x,
@@ -343,11 +283,7 @@ class VoiceOrbView(context: Context) : View(context) {
                 Color.rgb(30, 39, 52),
                 Color.rgb(15, 20, 29)
             ),
-            floatArrayOf(
-                0f,
-                0.65f,
-                1f
-            ),
+            floatArrayOf(0f, 0.65f, 1f),
             Shader.TileMode.CLAMP
         )
 
