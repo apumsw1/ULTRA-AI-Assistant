@@ -16,29 +16,27 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import androidx.core.app.NotificationCompat
-import com.ultra.assistant.data.LocalSettingsRepository
-import com.ultra.assistant.voice.LanguageManager
 import java.net.URLEncoder
 import java.util.Locale
 
 class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     companion object {
+        const val ACTION_START = "com.ultra.assistant.START_VOICE"
+        const val ACTION_STOP = "com.ultra.assistant.STOP_VOICE"
+
         @Volatile
-        var isRunning: Boolean = false
+        var isRunning = false
             private set
     }
 
-    private var speechRecognizer: SpeechRecognizer? = null
-    private var textToSpeech: TextToSpeech? = null
+    private var recognizer: SpeechRecognizer? = null
+    private var tts: TextToSpeech? = null
+
     private var ttsReady = false
-
     private var listening = false
-    private var commandMode = false
     private var restarting = false
-    private var processing = false
-
-    private lateinit var floatingDot: FloatingDot
+    private var speaking = false
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -54,18 +52,12 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             createNotification()
         )
 
-        textToSpeech = TextToSpeech(
+        tts = TextToSpeech(
             this,
             this
         )
 
-        floatingDot = FloatingDot(this)
-
-        if (android.provider.Settings.canDrawOverlays(this)) {
-            floatingDot.show()
-        }
-
-        createSpeechRecognizer()
+        setupRecognizer()
         startListening()
     }
 
@@ -75,15 +67,19 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         startId: Int
     ): Int {
 
-        if (
-            intent?.action == "SHOW_DOT" &&
-            ::floatingDot.isInitialized
-        ) {
-            floatingDot.show()
-        }
+        when (intent?.action) {
 
-        if (!listening) {
-            startListening()
+            ACTION_STOP -> {
+                stopVoiceService()
+                return START_NOT_STICKY
+            }
+
+            ACTION_START,
+            null -> {
+                if (!listening && !speaking) {
+                    startListening()
+                }
+            }
         }
 
         return START_STICKY
@@ -91,54 +87,53 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
 
-        if (status == TextToSpeech.SUCCESS) {
-
-            ttsReady = true
-
-            val language =
-                LocalSettingsRepository(this)
-                    .language()
-
-            textToSpeech?.language =
-                LanguageManager.locale(language)
-
-            textToSpeech?.setSpeechRate(0.96f)
-            textToSpeech?.setPitch(1.0f)
-        }
-    }
-
-    private fun createSpeechRecognizer() {
-
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            speak(
-                "Speech recognition is not available on this device."
-            )
+        if (status != TextToSpeech.SUCCESS) {
+            ttsReady = false
             return
         }
 
-        speechRecognizer?.destroy()
+        ttsReady = true
 
-        speechRecognizer =
-            SpeechRecognizer.createSpeechRecognizer(this)
+        val locale =
+            selectedLocale()
 
-        speechRecognizer?.setRecognitionListener(
+        tts?.language = locale
+        tts?.setSpeechRate(0.96f)
+        tts?.setPitch(1.0f)
+    }
+
+    private fun setupRecognizer() {
+
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            return
+        }
+
+        recognizer?.destroy()
+
+        recognizer =
+            SpeechRecognizer.createSpeechRecognizer(
+                this
+            )
+
+        recognizer?.setRecognitionListener(
             object : RecognitionListener {
 
                 override fun onReadyForSpeech(
                     params: Bundle?
                 ) {
                     listening = true
-                    notifyVoiceState("LISTENING")
+                    sendVoiceState("LISTENING")
                 }
 
                 override fun onBeginningOfSpeech() {
                     listening = true
-                    notifyVoiceState("LISTENING")
+                    sendVoiceState("LISTENING")
                 }
 
                 override fun onRmsChanged(
                     rmsdB: Float
                 ) {
+                    sendVoiceLevel(rmsdB)
                 }
 
                 override fun onBufferReceived(
@@ -148,82 +143,78 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
                 override fun onEndOfSpeech() {
                     listening = false
-                    notifyVoiceState("PROCESSING")
+                    sendVoiceState("PROCESSING")
                 }
 
                 override fun onError(
                     error: Int
                 ) {
-                    listening = false
-                    notifyVoiceState("IDLE")
 
-                    restartListening(
-                        if (
-                            error ==
-                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS
-                        ) {
-                            1500
-                        } else {
-                            700
+                    listening = false
+
+                    sendVoiceState("IDLE")
+
+                    when (error) {
+
+                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                            stopVoiceService()
                         }
-                    )
+
+                        SpeechRecognizer.ERROR_CLIENT -> {
+                            restartListening(1200)
+                        }
+
+                        else -> {
+                            restartListening(600)
+                        }
+                    }
                 }
 
                 override fun onResults(
                     results: Bundle?
                 ) {
+
                     listening = false
 
-                    val resultsList =
+                    val list =
                         results?.getStringArrayList(
                             SpeechRecognizer.RESULTS_RECOGNITION
                         )
 
-                    val phrase =
-                        resultsList
+                    val text =
+                        list
                             ?.firstOrNull()
                             ?.trim()
                             .orEmpty()
 
-                    if (phrase.isNotBlank()) {
-                        processPhrase(phrase)
-                    } else {
-                        notifyVoiceState("IDLE")
-                        restartListening(500)
+                    if (text.isEmpty()) {
+                        sendVoiceState("IDLE")
+                        restartListening(400)
+                        return
                     }
+
+                    sendRecognizedText(text)
+
+                    processCommand(text)
                 }
 
                 override fun onPartialResults(
                     partialResults: Bundle?
                 ) {
-                    val phrase =
-                        partialResults
-                            ?.getStringArrayList(
-                                SpeechRecognizer.RESULTS_RECOGNITION
-                            )
+
+                    val list =
+                        partialResults?.getStringArrayList(
+                            SpeechRecognizer.RESULTS_RECOGNITION
+                        )
+
+                    val text =
+                        list
                             ?.firstOrNull()
                             ?.trim()
                             .orEmpty()
 
-                    if (phrase.isBlank()) {
-                        return
-                    }
-
-                    notifyPartialText(phrase)
-
-                    if (
-                        !commandMode &&
-                        hasWakeWord(phrase)
-                    ) {
-                        commandMode = true
-
-                        stopCurrentRecognition()
-
-                        speak(
-                            wakeResponse()
-                        )
-
-                        restartListening(650)
+                    if (text.isNotEmpty()) {
+                        sendPartialText(text)
                     }
                 }
 
@@ -238,59 +229,19 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun startListening() {
 
-        if (processing || listening) {
+        if (speaking || listening) {
             return
         }
 
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            speak(
-                "Speech recognition is unavailable."
-            )
             return
         }
 
-        if (speechRecognizer == null) {
-            createSpeechRecognizer()
+        if (recognizer == null) {
+            setupRecognizer()
         }
 
-        val selectedLanguage =
-            LocalSettingsRepository(this)
-                .language()
-
-        val locale =
-            when (
-                selectedLanguage
-                    .lowercase(Locale.US)
-                    .trim()
-            ) {
-
-                "english",
-                "en",
-                "en-in",
-                "english india" ->
-                    "en-IN"
-
-                "हिन्दी",
-                "hindi",
-                "hi",
-                "hi-in",
-                "hindi india" ->
-                    "hi-IN"
-
-                "বাংলা",
-                "bangla",
-                "bengali",
-                "bn",
-                "bn-in",
-                "bengali india",
-                "indian bengali" ->
-                    "bn-IN"
-
-                else ->
-                    "en-IN"
-            }
-
-        val recognizerIntent =
+        val intent =
             Intent(
                 RecognizerIntent.ACTION_RECOGNIZE_SPEECH
             ).apply {
@@ -302,17 +253,12 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE,
-                    locale
+                    selectedLanguageTag()
                 )
 
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
-                    locale
-                )
-
-                putExtra(
-                    RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE,
-                    false
+                    selectedLanguageTag()
                 )
 
                 putExtra(
@@ -337,361 +283,205 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
                 putExtra(
                     RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
-                    1000L
+                    700L
                 )
             }
 
         try {
 
-            speechRecognizer?.startListening(
-                recognizerIntent
-            )
+            recognizer?.startListening(intent)
 
             listening = true
-            notifyVoiceState("LISTENING")
+
+            sendVoiceState("LISTENING")
 
         } catch (_: Exception) {
 
             listening = false
+
             restartListening(1200)
         }
     }
 
-    private fun processPhrase(
-        phrase: String
+    private fun processCommand(
+        text: String
     ) {
 
-        val clean =
-            phrase.trim()
+        val command =
+            text.trim()
 
-        if (clean.isBlank()) {
+        if (command.isEmpty()) {
             restartListening(500)
             return
         }
 
-        if (!commandMode) {
-
-            if (hasWakeWord(clean)) {
-
-                val command =
-                    removeWakeWord(clean)
-
-                if (command.isBlank()) {
-
-                    commandMode = true
-
-                    speak(
-                        wakeResponse()
-                    )
-
-                } else {
-
-                    commandMode = false
-
-                    executeCommand(command)
-                }
-
-                restartListening(700)
-
-                return
-            }
-
-            restartListening(400)
-
-            return
-        }
-
-        commandMode = false
-
-        val command =
-            removeWakeWord(clean)
-                .trim()
-
-        if (command.isNotBlank()) {
-
-            executeCommand(command)
-
-        } else {
-
-            speak(
-                emptyCommandResponse()
-            )
-
-            restartListening(700)
-        }
-    }
-
-    private fun executeCommand(
-        command: String
-    ) {
-
-        if (processing) {
-            return
-        }
-
-        processing = true
-        notifyVoiceState("PROCESSING")
-
-        val q =
-            command.trim().ifBlank {
-                "help"
-            }
-
         when {
 
-            containsAny(
-                q,
-                "lock phone",
-                "lock my phone",
-                "ফোন লক",
-                "ফোনটা লক",
-                "फोन लॉक"
+            contains(
+                command,
+                "hello",
+                "হ্যালো",
+                "नमस्ते"
             ) -> {
 
-                lockPhone()
-            }
-
-            containsAny(
-                q,
-                "next",
-                "next song",
-                "next track",
-                "পরের গান",
-                "পরেরটা",
-                "अगला"
-            ) -> {
-
-                sendBroadcast(
-                    Intent(
-                        "com.ultra.assistant.NEXT_TRACK"
-                    )
-                )
-
-                finishCommand(
-                    response(
-                        "I will skip to the next track.",
-                        "পরের ট্র্যাকে যাচ্ছি।",
-                        "अगले ट्रैक पर जा रहा हूँ।"
-                    )
+                speak(
+                    english = "Hello. I am listening.",
+                    bengali = "হ্যালো। আমি শুনছি।",
+                    hindi = "नमस्ते। मैं सुन रहा हूँ।"
                 )
             }
 
-            containsAny(
-                q,
-                "open chrome",
-                "chrome open",
-                "ক্রোম খোলো",
-                "ক্রোম ওপেন",
-                "क्रोम खोलो"
-            ) -> {
-
-                launchPackage(
-                    "com.android.chrome",
-                    "Chrome"
-                )
-            }
-
-            containsAny(
-                q,
+            contains(
+                command,
                 "open settings",
-                "settings open",
+                "settings",
                 "সেটিংস খোলো",
-                "সেটিংস ওপেন",
-                "सेटिंग खोलो"
+                "সেটিংস",
+                "सेटिंग खोलो",
+                "सेटिंग"
             ) -> {
 
-                launchPackage(
+                openApplication(
                     "com.android.settings",
                     "Settings"
                 )
             }
 
-            containsAny(
-                q,
-                "youtube",
-                "ইউটিউব",
-                "यूट्यूब",
-                "song",
-                "music",
-                "গান",
-                "মিউজিক",
-                "गाना",
-                "म्यूजिक"
+            contains(
+                command,
+                "open chrome",
+                "chrome",
+                "ক্রোম খোলো",
+                "ক্রোম",
+                "क्रोम खोलो",
+                "क्रोम"
             ) -> {
 
-                val searchUrl =
-                    "https://www.youtube.com/results?search_query=" +
-                        urlEncode(q)
-
-                openUrl(
-                    searchUrl,
-                    response(
-                        "Searching YouTube.",
-                        "YouTube-এ খুঁজছি।",
-                        "YouTube पर खोज रहा हूँ।"
-                    )
+                openApplication(
+                    "com.android.chrome",
+                    "Chrome"
                 )
             }
 
-            containsAny(
-                q,
+            contains(
+                command,
+                "open youtube",
+                "youtube",
+                "ইউটিউব খোলো",
+                "ইউটিউব",
+                "यूट्यूब खोलो",
+                "यूट्यूब"
+            ) -> {
+
+                openUrl(
+                    "https://www.youtube.com/",
+                    english = "Opening YouTube.",
+                    bengali = "YouTube খুলছি।",
+                    hindi = "YouTube खोल रहा हूँ।"
+                )
+            }
+
+            contains(
+                command,
                 "search",
-                "search for",
                 "সার্চ",
-                "খুঁজে",
-                "খোঁজ",
-                "সার্চ কর",
+                "খুঁজে দেখ",
                 "सर्च",
                 "खोजो"
             ) -> {
 
-                val searchUrl =
+                val url =
                     "https://www.google.com/search?q=" +
-                        urlEncode(q)
+                        encode(command)
 
                 openUrl(
-                    searchUrl,
-                    response(
-                        "Searching Google.",
-                        "Google-এ খুঁজছি।",
-                        "Google पर खोज रहा हूँ।"
-                    )
+                    url,
+                    english = "Searching.",
+                    bengali = "সার্চ করছি।",
+                    hindi = "सर्च कर रहा हूँ।"
                 )
             }
 
             else -> {
 
-                val searchUrl =
+                val url =
                     "https://www.google.com/search?q=" +
-                        urlEncode(q)
+                        encode(command)
 
                 openUrl(
-                    searchUrl,
-                    response(
-                        "I am searching for that.",
-                        "আমি এটা খুঁজে দেখছি।",
-                        "मैं इसे खोज रहा हूँ।"
-                    )
+                    url,
+                    english = "I am searching for that.",
+                    bengali = "আমি এটা খুঁজে দেখছি।",
+                    hindi = "मैं इसे खोज रहा हूँ।"
                 )
             }
         }
     }
 
-    private fun lockPhone() {
-
-        val admin =
-            android.content.ComponentName(
-                this,
-                com.ultra.assistant.admin.UltraDeviceAdminReceiver::class.java
-            )
-
-        val policy =
-            getSystemService(
-                DEVICE_POLICY_SERVICE
-            ) as android.app.admin.DevicePolicyManager
-
-        if (policy.isAdminActive(admin)) {
-
-            runCatching {
-
-                policy.lockNow()
-
-                finishCommand(
-                    response(
-                        "Locking the phone now.",
-                        "ফোন এখন লক করছি।",
-                        "फोन अभी लॉक कर रहा हूँ।"
-                    )
-                )
-
-            }.onFailure {
-
-                finishCommand(
-                    response(
-                        "I could not lock the phone.",
-                        "ফোন লক করা যায়নি।",
-                        "फोन लॉक नहीं हो सका।"
-                    )
-                )
-            }
-
-        } else {
-
-            finishCommand(
-                response(
-                    "Device Administrator permission is not active.",
-                    "Device Administrator permission is not active.",
-                    "Device Administrator permission is not active."
-                )
-            )
-        }
-    }
-
-    private fun launchPackage(
+    private fun openApplication(
         packageName: String,
-        appName: String
+        name: String
     ) {
 
-        val launchIntent =
+        val intent =
             packageManager.getLaunchIntentForPackage(
                 packageName
             )
 
-        if (launchIntent == null) {
+        if (intent == null) {
 
-            finishCommand(
-                response(
-                    "$appName is not installed.",
-                    "$appName ইনস্টল করা নেই।",
-                    "$appName इंस्टॉल नहीं है।"
-                )
+            speak(
+                english = "$name is not available.",
+                bengali = "$name পাওয়া যাচ্ছে না।",
+                hindi = "$name उपलब्ध नहीं है।"
             )
+
+            restartListening(1400)
 
             return
         }
 
-        launchIntent.addFlags(
+        intent.addFlags(
             Intent.FLAG_ACTIVITY_NEW_TASK
         )
 
-        runCatching {
+        try {
 
-            startActivity(launchIntent)
+            startActivity(intent)
 
-            finishCommand(
-                response(
-                    "Opening $appName.",
-                    "$appName খুলছি।",
-                    "$appName खोल रहा हूँ।"
-                )
+            speak(
+                english = "Opening $name.",
+                bengali = "$name খুলছি।",
+                hindi = "$name खोल रहा हूँ।"
             )
 
-        }.onFailure {
+        } catch (_: Exception) {
 
-            finishCommand(
-                response(
-                    "I could not open $appName.",
-                    "$appName খোলা যায়নি।",
-                    "$appName नहीं खुल सका।"
-                )
+            speak(
+                english = "I could not open $name.",
+                bengali = "$name খোলা যায়নি।",
+                hindi = "$name नहीं खुल सका।"
             )
         }
     }
 
     private fun openUrl(
         url: String,
-        message: String
+        english: String,
+        bengali: String,
+        hindi: String
     ) {
 
-        speak(message)
-
-        runCatching {
+        try {
 
             val intent =
                 Intent(
-                    Intent.ACTION_VIEW,
-                    android.net.Uri.parse(url)
+                    Intent.ACTION_VIEW
                 ).apply {
+
+                    data =
+                        android.net.Uri.parse(url)
+
                     addFlags(
                         Intent.FLAG_ACTIVITY_NEW_TASK
                     )
@@ -699,37 +489,26 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
             startActivity(intent)
 
-            processing = false
-            notifyVoiceState("SPEAKING")
+            speak(
+                english = english,
+                bengali = bengali,
+                hindi = hindi
+            )
 
-            restartListening(1800)
+        } catch (_: Exception) {
 
-        }.onFailure {
-
-            finishCommand(
-                response(
-                    "I could not open the browser.",
-                    "ব্রাউজার খোলা যায়নি।",
-                    "ब्राउज़र नहीं खुल सका।"
-                )
+            speak(
+                english = "I could not open it.",
+                bengali = "এটি খোলা যায়নি।",
+                hindi = "इसे खोला नहीं जा सका।"
             )
         }
     }
 
-    private fun finishCommand(
-        message: String
-    ) {
-
-        speak(message)
-
-        processing = false
-        notifyVoiceState("SPEAKING")
-
-        restartListening(1600)
-    }
-
     private fun speak(
-        message: String
+        english: String,
+        bengali: String,
+        hindi: String
     ) {
 
         if (!ttsReady) {
@@ -737,96 +516,129 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
 
         val language =
-            LocalSettingsRepository(this)
-                .language()
+            selectedLanguage()
 
-        textToSpeech?.language =
-            LanguageManager.locale(language)
+        tts?.language = language
 
-        textToSpeech?.speak(
-            message,
+        val text =
+            when (
+                selectedLanguageTag()
+            ) {
+
+                "bn-IN" ->
+                    bengali
+
+                "hi-IN" ->
+                    hindi
+
+                else ->
+                    english
+            }
+
+        speaking = true
+
+        sendVoiceState("SPEAKING")
+
+        tts?.speak(
+            text,
             TextToSpeech.QUEUE_FLUSH,
             null,
-            "ultra-${System.currentTimeMillis()}"
+            "ultra_voice_${System.currentTimeMillis()}"
+        )
+
+        handler.postDelayed(
+            {
+                speaking = false
+                sendVoiceState("IDLE")
+                restartListening(350)
+            },
+            1400L
         )
     }
 
-    private fun response(
-        english: String,
-        bengali: String,
-        hindi: String
-    ): String {
+    private fun selectedLanguageTag(): String {
+
+        val value =
+            readLanguageSetting()
 
         return when (
-            LocalSettingsRepository(this)
-                .language()
+            value
                 .lowercase(Locale.US)
                 .trim()
         ) {
 
-            "বাংলা",
-            "bangla",
-            "bengali",
-            "bn",
-            "bn-in",
-            "bengali india",
-            "indian bengali" ->
-                bengali
-
-            "हिन्दी",
             "hindi",
             "hi",
             "hi-in",
-            "hindi india" ->
-                hindi
+            "हिन्दी",
+            "हिंदी" ->
+                "hi-IN"
+
+            "bengali",
+            "bangla",
+            "bn",
+            "bn-in",
+            "বাংলা",
+            "indian bengali" ->
+                "bn-IN"
 
             else ->
-                english
+                "en-IN"
         }
     }
 
-    private fun wakeResponse(): String {
+    private fun selectedLocale(): Locale {
 
-        return response(
-            "Yes, I am listening.",
-            "জি, আমি শুনছি।",
-            "जी, मैं सुन रहा हूँ।"
-        )
+        return when (
+            selectedLanguageTag()
+        ) {
+
+            "hi-IN" ->
+                Locale("hi", "IN")
+
+            "bn-IN" ->
+                Locale("bn", "IN")
+
+            else ->
+                Locale("en", "IN")
+        }
     }
 
-    private fun emptyCommandResponse(): String {
+    private fun readLanguageSetting(): String {
 
-        return response(
-            "I did not hear a command.",
-            "আমি কোনো কমান্ড শুনতে পাইনি।",
-            "मैंने कोई कमांड नहीं सुनी।"
-        )
+        return try {
+
+            val clazz =
+                Class.forName(
+                    "com.ultra.assistant.data.LocalSettingsRepository"
+                )
+
+            val constructor =
+                clazz.getConstructor(
+                    android.content.Context::class.java
+                )
+
+            val repository =
+                constructor.newInstance(this)
+
+            val method =
+                clazz.getMethod("language")
+
+            method.invoke(repository) as? String
+                ?: "english"
+
+        } catch (_: Exception) {
+
+            "english"
+        }
     }
 
-    private fun hasWakeWord(
-        text: String
-    ): Boolean {
-
-        return com.ultra.assistant.voice
-            .WakeWordEngine
-            .detected(text)
-    }
-
-    private fun removeWakeWord(
-        text: String
-    ): String {
-
-        return com.ultra.assistant.voice
-            .WakeWordEngine
-            .strip(text)
-    }
-
-    private fun containsAny(
+    private fun contains(
         text: String,
-        vararg values: String
+        vararg words: String
     ): Boolean {
 
-        return values.any {
+        return words.any {
             text.contains(
                 it,
                 ignoreCase = true
@@ -834,7 +646,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun urlEncode(
+    private fun encode(
         text: String
     ): String {
 
@@ -844,57 +656,102 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         )
     }
 
-    private fun stopCurrentRecognition() {
-
-        try {
-            speechRecognizer?.stopListening()
-        } catch (_: Exception) {
-        }
-
-        listening = false
-    }
-
     private fun restartListening(
         delay: Long
     ) {
 
-        if (restarting) {
+        if (restarting || isDestroyed) {
             return
         }
 
         restarting = true
 
-        handler.postDelayed({
+        handler.postDelayed(
+            {
 
-            restarting = false
+                restarting = false
 
-            if (!isDestroyed) {
-
-                if (speechRecognizer == null) {
-                    createSpeechRecognizer()
-                }
-
-                if (!listening && !processing) {
+                if (!isDestroyed &&
+                    !speaking &&
+                    !listening
+                ) {
                     startListening()
                 }
-            }
 
-        }, delay)
+            },
+            delay
+        )
     }
 
-    private fun notifyVoiceState(
+    private fun sendVoiceState(
         state: String
     ) {
+
+        sendBroadcast(
+            Intent(
+                "com.ultra.assistant.VOICE_STATE"
+            ).apply {
+                putExtra(
+                    "state",
+                    state
+                )
+            }
+        )
     }
 
-    private fun notifyPartialText(
+    private fun sendRecognizedText(
         text: String
     ) {
+
+        sendBroadcast(
+            Intent(
+                "com.ultra.assistant.VOICE_TEXT"
+            ).apply {
+                putExtra(
+                    "text",
+                    text
+                )
+            }
+        )
+    }
+
+    private fun sendPartialText(
+        text: String
+    ) {
+
+        sendBroadcast(
+            Intent(
+                "com.ultra.assistant.VOICE_PARTIAL"
+            ).apply {
+                putExtra(
+                    "text",
+                    text
+                )
+            }
+        )
+    }
+
+    private fun sendVoiceLevel(
+        level: Float
+    ) {
+
+        sendBroadcast(
+            Intent(
+                "com.ultra.assistant.VOICE_LEVEL"
+            ).apply {
+                putExtra(
+                    "level",
+                    level
+                )
+            }
+        )
     }
 
     private fun createNotificationChannel() {
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.O
+        ) {
 
             val channel =
                 NotificationChannel(
@@ -903,22 +760,30 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                     NotificationManager.IMPORTANCE_LOW
                 )
 
-            getSystemService(
-                NotificationManager::class.java
-            ).createNotificationChannel(channel)
+            val manager =
+                getSystemService(
+                    NotificationManager::class.java
+                )
+
+            manager.createNotificationChannel(
+                channel
+            )
         }
     }
 
     private fun createNotification(): Notification {
 
+        val intent =
+            Intent(
+                this,
+                MainActivity::class.java
+            )
+
         val pendingIntent =
             PendingIntent.getActivity(
                 this,
                 0,
-                Intent(
-                    this,
-                    MainActivity::class.java
-                ),
+                intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or
                     PendingIntent.FLAG_IMMUTABLE
             )
@@ -943,29 +808,54 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             .build()
     }
 
+    private fun stopVoiceService() {
+
+        try {
+            recognizer?.cancel()
+            recognizer?.destroy()
+        } catch (_: Exception) {
+        }
+
+        recognizer = null
+
+        try {
+            tts?.stop()
+            tts?.shutdown()
+        } catch (_: Exception) {
+        }
+
+        tts = null
+
+        listening = false
+        speaking = false
+        isRunning = false
+
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     override fun onDestroy() {
 
         handler.removeCallbacksAndMessages(null)
 
         try {
-            speechRecognizer?.cancel()
-            speechRecognizer?.destroy()
+            recognizer?.cancel()
+            recognizer?.destroy()
         } catch (_: Exception) {
         }
 
-        speechRecognizer = null
+        recognizer = null
 
-        textToSpeech?.stop()
-        textToSpeech?.shutdown()
-        textToSpeech = null
-
-        if (::floatingDot.isInitialized) {
-            floatingDot.hide()
+        try {
+            tts?.stop()
+            tts?.shutdown()
+        } catch (_: Exception) {
         }
 
+        tts = null
+
         listening = false
-        processing = false
-        restarting = false
+        speaking = false
         isRunning = false
 
         super.onDestroy()
@@ -976,23 +866,4 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     ): IBinder? {
         return null
     }
-}
-
-private fun String.hasWakeWord(): Boolean {
-    return com.ultra.assistant.voice
-        .WakeWordEngine
-        .detected(this)
-}
-
-private fun String.removeWake(): String {
-    return com.ultra.assistant.voice
-        .WakeWordEngine
-        .strip(this)
-}
-
-private fun String.urlPart(): String {
-    return URLEncoder.encode(
-        this,
-        "UTF-8"
-    )
 }
