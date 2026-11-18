@@ -1,205 +1,998 @@
 package com.ultra.assistant
 
-import android.app.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.speech.*
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import androidx.core.app.NotificationCompat
-import java.util.Locale
 import com.ultra.assistant.data.LocalSettingsRepository
 import com.ultra.assistant.voice.LanguageManager
+import java.net.URLEncoder
+import java.util.Locale
 
 class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
-    companion object { @Volatile var isRunning: Boolean = false; private set }
-    private var speech: SpeechRecognizer? = null
-    private var tts: TextToSpeech? = null
+
+    companion object {
+        @Volatile
+        var isRunning: Boolean = false
+            private set
+    }
+
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var textToSpeech: TextToSpeech? = null
     private var ttsReady = false
+
+    private var listening = false
     private var commandMode = false
-    private var isListening = false
-    private var restartQueued = false
-    private lateinit var dot: FloatingDot
+    private var restarting = false
+    private var processing = false
+
+    private lateinit var floatingDot: FloatingDot
+
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate() {
         super.onCreate()
+
         isRunning = true
-        makeChannel()
-        startForeground(31, makeNotification())
-        tts = TextToSpeech(this, this)
-        dot = FloatingDot(this)
-        if (android.provider.Settings.canDrawOverlays(this)) dot.show()
-        beginListening()
+
+        createNotificationChannel()
+
+        startForeground(
+            31,
+            createNotification()
+        )
+
+        textToSpeech = TextToSpeech(
+            this,
+            this
+        )
+
+        floatingDot = FloatingDot(this)
+
+        if (android.provider.Settings.canDrawOverlays(this)) {
+            floatingDot.show()
+        }
+
+        createSpeechRecognizer()
+        startListening()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == "SHOW_DOT" && ::dot.isInitialized) dot.show()
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+
+        if (
+            intent?.action == "SHOW_DOT" &&
+            ::floatingDot.isInitialized
+        ) {
+            floatingDot.show()
+        }
+
+        if (!listening) {
+            startListening()
+        }
+
         return START_STICKY
     }
 
-    override fun onInit(result: Int) {
-        if (result == TextToSpeech.SUCCESS) {
+    override fun onInit(status: Int) {
+
+        if (status == TextToSpeech.SUCCESS) {
+
             ttsReady = true
-            tts?.language = LanguageManager.locale(LocalSettingsRepository(this@VoiceAssistantService).language())
+
+            val language =
+                LocalSettingsRepository(this)
+                    .language()
+
+            textToSpeech?.language =
+                LanguageManager.locale(language)
+
+            textToSpeech?.setSpeechRate(0.96f)
+            textToSpeech?.setPitch(1.0f)
         }
     }
 
-    private fun beginListening() {
+    private fun createSpeechRecognizer() {
+
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            say("Speech recognition is unavailable on this device.")
+            speak(
+                "Speech recognition is not available on this device."
+            )
             return
         }
-        if (speech == null) {
-            speech = SpeechRecognizer.createSpeechRecognizer(this)
-            speech?.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) { isListening = true }
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() { isListening = false }
-                override fun onError(error: Int) { isListening = false; queueRestart(1300) }
-                override fun onResults(results: Bundle?) {
-                    isListening = false
-                    val phrase = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
-                    processPhrase(phrase)
-                    queueRestart(800)
+
+        speechRecognizer?.destroy()
+
+        speechRecognizer =
+            SpeechRecognizer.createSpeechRecognizer(this)
+
+        speechRecognizer?.setRecognitionListener(
+            object : RecognitionListener {
+
+                override fun onReadyForSpeech(
+                    params: Bundle?
+                ) {
+                    listening = true
+                    notifyVoiceState("LISTENING")
                 }
-                override fun onPartialResults(partialResults: Bundle?) {
-                    val phrase = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
-                    if (!commandMode && phrase.hasWakeWord()) {
-                        commandMode = true
-                        say("Yes, tell me.")
+
+                override fun onBeginningOfSpeech() {
+                    listening = true
+                    notifyVoiceState("LISTENING")
+                }
+
+                override fun onRmsChanged(
+                    rmsdB: Float
+                ) {
+                }
+
+                override fun onBufferReceived(
+                    buffer: ByteArray?
+                ) {
+                }
+
+                override fun onEndOfSpeech() {
+                    listening = false
+                    notifyVoiceState("PROCESSING")
+                }
+
+                override fun onError(
+                    error: Int
+                ) {
+                    listening = false
+                    notifyVoiceState("IDLE")
+
+                    restartListening(
+                        if (
+                            error ==
+                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS
+                        ) {
+                            1500
+                        } else {
+                            700
+                        }
+                    )
+                }
+
+                override fun onResults(
+                    results: Bundle?
+                ) {
+                    listening = false
+
+                    val resultsList =
+                        results?.getStringArrayList(
+                            SpeechRecognizer.RESULTS_RECOGNITION
+                        )
+
+                    val phrase =
+                        resultsList
+                            ?.firstOrNull()
+                            ?.trim()
+                            .orEmpty()
+
+                    if (phrase.isNotBlank()) {
+                        processPhrase(phrase)
+                    } else {
+                        notifyVoiceState("IDLE")
+                        restartListening(500)
                     }
                 }
-                override fun onEvent(eventType: Int, params: Bundle?) {}
-            })
-        }
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            val tag = when (LocalSettingsRepository(this@VoiceAssistantService).language()) {
-                "English" -> "en-IN"
-                "हिन्दी" -> "hi-IN"
-                else -> "bn-BD"
+
+                override fun onPartialResults(
+                    partialResults: Bundle?
+                ) {
+                    val phrase =
+                        partialResults
+                            ?.getStringArrayList(
+                                SpeechRecognizer.RESULTS_RECOGNITION
+                            )
+                            ?.firstOrNull()
+                            ?.trim()
+                            .orEmpty()
+
+                    if (phrase.isBlank()) {
+                        return
+                    }
+
+                    notifyPartialText(phrase)
+
+                    if (
+                        !commandMode &&
+                        hasWakeWord(phrase)
+                    ) {
+                        commandMode = true
+
+                        stopCurrentRecognition()
+
+                        speak(
+                            wakeResponse()
+                        )
+
+                        restartListening(650)
+                    }
+                }
+
+                override fun onEvent(
+                    eventType: Int,
+                    params: Bundle?
+                ) {
+                }
             }
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, tag)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, tag)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-        }
-        try { speech?.startListening(i); isListening = true } catch (_: Exception) { queueRestart(1500) }
+        )
     }
 
-    private fun processPhrase(phrase: String) {
-        if (phrase.isBlank()) return
-        if (!commandMode && phrase.hasWakeWord()) {
-            val inlineCommand = phrase.removeWake()
-            if (inlineCommand.isBlank()) {
-                commandMode = true
-                say(if (LocalSettingsRepository(this).language() == "বাংলা") "জি, বলুন।" else "Yes, tell me.")
-            } else {
-                executeCommand(inlineCommand)
-            }
+    private fun startListening() {
+
+        if (processing || listening) {
             return
         }
-        if (commandMode) {
-            val command = phrase.removeWake()
-            if (phrase.hasWakeWord() && command.isBlank()) {
-                // Keep command mode armed: the next recognition session captures the user's command.
+
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            speak(
+                "Speech recognition is unavailable."
+            )
+            return
+        }
+
+        if (speechRecognizer == null) {
+            createSpeechRecognizer()
+        }
+
+        val selectedLanguage =
+            LocalSettingsRepository(this)
+                .language()
+
+        val locale =
+            when (
+                selectedLanguage
+                    .lowercase(Locale.US)
+                    .trim()
+            ) {
+
+                "english",
+                "en",
+                "en-in",
+                "english india" ->
+                    "en-IN"
+
+                "हिन्दी",
+                "hindi",
+                "hi",
+                "hi-in",
+                "hindi india" ->
+                    "hi-IN"
+
+                "বাংলা",
+                "bangla",
+                "bengali",
+                "bn",
+                "bn-in",
+                "bengali india",
+                "indian bengali" ->
+                    "bn-IN"
+
+                else ->
+                    "en-IN"
+            }
+
+        val recognizerIntent =
+            Intent(
+                RecognizerIntent.ACTION_RECOGNIZE_SPEECH
+            ).apply {
+
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE,
+                    locale
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
+                    locale
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE,
+                    false
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_PARTIAL_RESULTS,
+                    true
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_MAX_RESULTS,
+                    5
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+                    1200L
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                    900L
+                )
+
+                putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
+                    1000L
+                )
+            }
+
+        try {
+
+            speechRecognizer?.startListening(
+                recognizerIntent
+            )
+
+            listening = true
+            notifyVoiceState("LISTENING")
+
+        } catch (_: Exception) {
+
+            listening = false
+            restartListening(1200)
+        }
+    }
+
+    private fun processPhrase(
+        phrase: String
+    ) {
+
+        val clean =
+            phrase.trim()
+
+        if (clean.isBlank()) {
+            restartListening(500)
+            return
+        }
+
+        if (!commandMode) {
+
+            if (hasWakeWord(clean)) {
+
+                val command =
+                    removeWakeWord(clean)
+
+                if (command.isBlank()) {
+
+                    commandMode = true
+
+                    speak(
+                        wakeResponse()
+                    )
+
+                } else {
+
+                    commandMode = false
+
+                    executeCommand(command)
+                }
+
+                restartListening(700)
+
                 return
             }
-            commandMode = false
-            if (command.isNotBlank()) executeCommand(command)
+
+            restartListening(400)
+
+            return
+        }
+
+        commandMode = false
+
+        val command =
+            removeWakeWord(clean)
+                .trim()
+
+        if (command.isNotBlank()) {
+
+            executeCommand(command)
+
+        } else {
+
+            speak(
+                emptyCommandResponse()
+            )
+
+            restartListening(700)
         }
     }
 
-    private fun executeCommand(command: String) {
-        val q = command.trim().ifBlank { "help" }
+    private fun executeCommand(
+        command: String
+    ) {
+
+        if (processing) {
+            return
+        }
+
+        processing = true
+        notifyVoiceState("PROCESSING")
+
+        val q =
+            command.trim().ifBlank {
+                "help"
+            }
+
         when {
-            q.contains("lock phone", true) || q.contains("ফোন লক") -> {
-                val admin = android.content.ComponentName(this, com.ultra.assistant.admin.UltraDeviceAdminReceiver::class.java)
-                val policy = getSystemService(android.content.Context.DEVICE_POLICY_SERVICE) as android.app.admin.DevicePolicyManager
-                if (policy.isAdminActive(admin)) {
-                    runCatching { policy.lockNow(); say("Locking the phone now.") }
-                        .onFailure { say("I could not lock the phone.") }
-                } else say("Device Administrator permission is not active.")
+
+            containsAny(
+                q,
+                "lock phone",
+                "lock my phone",
+                "ফোন লক",
+                "ফোনটা লক",
+                "फोन लॉक"
+            ) -> {
+
+                lockPhone()
             }
-            q.contains("next", true) || q.contains("পরের গান") -> {
-                sendBroadcast(Intent("com.ultra.assistant.NEXT_TRACK"))
-                say("I will try to skip to the next track.")
+
+            containsAny(
+                q,
+                "next",
+                "next song",
+                "next track",
+                "পরের গান",
+                "পরেরটা",
+                "अगला"
+            ) -> {
+
+                sendBroadcast(
+                    Intent(
+                        "com.ultra.assistant.NEXT_TRACK"
+                    )
+                )
+
+                finishCommand(
+                    response(
+                        "I will skip to the next track.",
+                        "পরের ট্র্যাকে যাচ্ছি।",
+                        "अगले ट्रैक पर जा रहा हूँ।"
+                    )
+                )
             }
-            q.contains("youtube", true) || q.contains("ইউটিউব") || q.contains("গান") || q.contains("song", true) || q.contains("music", true) ->
-                search("https://www.youtube.com/results?search_query=" + ("Hindi song " + q).urlPart(), "Searching YouTube.")
-            q.contains("open chrome", true) || q.contains("ক্রোম খোলো") || q.contains("ক্রোম ওপেন") -> launchPackage("com.android.chrome", "Chrome")
-            q.contains("open settings", true) || q.contains("সেটিংস খোলো") || q.contains("সেটিংস ওপেন") -> launchPackage("com.android.settings", "Settings")
-            q.contains("search", true) || q.contains("সার্চ") || q.contains("খুঁজে") ->
-                search("https://www.google.com/search?q=" + q.urlPart(), "Searching Google.")
-            else -> search("https://www.google.com/search?q=" + q.urlPart(), "I am searching for that.")
+
+            containsAny(
+                q,
+                "open chrome",
+                "chrome open",
+                "ক্রোম খোলো",
+                "ক্রোম ওপেন",
+                "क्रोम खोलो"
+            ) -> {
+
+                launchPackage(
+                    "com.android.chrome",
+                    "Chrome"
+                )
+            }
+
+            containsAny(
+                q,
+                "open settings",
+                "settings open",
+                "সেটিংস খোলো",
+                "সেটিংস ওপেন",
+                "सेटिंग खोलो"
+            ) -> {
+
+                launchPackage(
+                    "com.android.settings",
+                    "Settings"
+                )
+            }
+
+            containsAny(
+                q,
+                "youtube",
+                "ইউটিউব",
+                "यूट्यूब",
+                "song",
+                "music",
+                "গান",
+                "মিউজিক",
+                "गाना",
+                "म्यूजिक"
+            ) -> {
+
+                val searchUrl =
+                    "https://www.youtube.com/results?search_query=" +
+                        urlEncode(q)
+
+                openUrl(
+                    searchUrl,
+                    response(
+                        "Searching YouTube.",
+                        "YouTube-এ খুঁজছি।",
+                        "YouTube पर खोज रहा हूँ।"
+                    )
+                )
+            }
+
+            containsAny(
+                q,
+                "search",
+                "search for",
+                "সার্চ",
+                "খুঁজে",
+                "খোঁজ",
+                "সার্চ কর",
+                "सर्च",
+                "खोजो"
+            ) -> {
+
+                val searchUrl =
+                    "https://www.google.com/search?q=" +
+                        urlEncode(q)
+
+                openUrl(
+                    searchUrl,
+                    response(
+                        "Searching Google.",
+                        "Google-এ খুঁজছি।",
+                        "Google पर खोज रहा हूँ।"
+                    )
+                )
+            }
+
+            else -> {
+
+                val searchUrl =
+                    "https://www.google.com/search?q=" +
+                        urlEncode(q)
+
+                openUrl(
+                    searchUrl,
+                    response(
+                        "I am searching for that.",
+                        "আমি এটা খুঁজে দেখছি।",
+                        "मैं इसे खोज रहा हूँ।"
+                    )
+                )
+            }
         }
     }
 
-    private fun launchPackage(pkg: String, name: String) {
-        val i = packageManager.getLaunchIntentForPackage(pkg)
-        if (i == null) say("$name is not installed.")
-        else { i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(i); say("Opening $name.") }
-    }
+    private fun lockPhone() {
 
-    private fun search(url: String, response: String) {
-        say(response)
-        try { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
-        catch (_: Exception) { say("I could not open the browser.") }
-    }
+        val admin =
+            android.content.ComponentName(
+                this,
+                com.ultra.assistant.admin.UltraDeviceAdminReceiver::class.java
+            )
 
-    private fun say(message: String) {
-        if (ttsReady) {
-            tts?.language = LanguageManager.locale(LocalSettingsRepository(this).language())
-            tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "ultra-${System.currentTimeMillis()}")
+        val policy =
+            getSystemService(
+                DEVICE_POLICY_SERVICE
+            ) as android.app.admin.DevicePolicyManager
+
+        if (policy.isAdminActive(admin)) {
+
+            runCatching {
+
+                policy.lockNow()
+
+                finishCommand(
+                    response(
+                        "Locking the phone now.",
+                        "ফোন এখন লক করছি।",
+                        "फोन अभी लॉक कर रहा हूँ।"
+                    )
+                )
+
+            }.onFailure {
+
+                finishCommand(
+                    response(
+                        "I could not lock the phone.",
+                        "ফোন লক করা যায়নি।",
+                        "फोन लॉक नहीं हो सका।"
+                    )
+                )
+            }
+
+        } else {
+
+            finishCommand(
+                response(
+                    "Device Administrator permission is not active.",
+                    "Device Administrator permission is not active.",
+                    "Device Administrator permission is not active."
+                )
+            )
         }
     }
 
-    private fun queueRestart(delay: Long) {
-        if (restartQueued) return
-        restartQueued = true
+    private fun launchPackage(
+        packageName: String,
+        appName: String
+    ) {
+
+        val launchIntent =
+            packageManager.getLaunchIntentForPackage(
+                packageName
+            )
+
+        if (launchIntent == null) {
+
+            finishCommand(
+                response(
+                    "$appName is not installed.",
+                    "$appName ইনস্টল করা নেই।",
+                    "$appName इंस्टॉल नहीं है।"
+                )
+            )
+
+            return
+        }
+
+        launchIntent.addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK
+        )
+
+        runCatching {
+
+            startActivity(launchIntent)
+
+            finishCommand(
+                response(
+                    "Opening $appName.",
+                    "$appName খুলছি।",
+                    "$appName खोल रहा हूँ।"
+                )
+            )
+
+        }.onFailure {
+
+            finishCommand(
+                response(
+                    "I could not open $appName.",
+                    "$appName খোলা যায়নি।",
+                    "$appName नहीं खुल सका।"
+                )
+            )
+        }
+    }
+
+    private fun openUrl(
+        url: String,
+        message: String
+    ) {
+
+        speak(message)
+
+        runCatching {
+
+            val intent =
+                Intent(
+                    Intent.ACTION_VIEW,
+                    android.net.Uri.parse(url)
+                ).apply {
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK
+                    )
+                }
+
+            startActivity(intent)
+
+            processing = false
+            notifyVoiceState("SPEAKING")
+
+            restartListening(1800)
+
+        }.onFailure {
+
+            finishCommand(
+                response(
+                    "I could not open the browser.",
+                    "ব্রাউজার খোলা যায়নি।",
+                    "ब्राउज़र नहीं खुल सका।"
+                )
+            )
+        }
+    }
+
+    private fun finishCommand(
+        message: String
+    ) {
+
+        speak(message)
+
+        processing = false
+        notifyVoiceState("SPEAKING")
+
+        restartListening(1600)
+    }
+
+    private fun speak(
+        message: String
+    ) {
+
+        if (!ttsReady) {
+            return
+        }
+
+        val language =
+            LocalSettingsRepository(this)
+                .language()
+
+        textToSpeech?.language =
+            LanguageManager.locale(language)
+
+        textToSpeech?.speak(
+            message,
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            "ultra-${System.currentTimeMillis()}"
+        )
+    }
+
+    private fun response(
+        english: String,
+        bengali: String,
+        hindi: String
+    ): String {
+
+        return when (
+            LocalSettingsRepository(this)
+                .language()
+                .lowercase(Locale.US)
+                .trim()
+        ) {
+
+            "বাংলা",
+            "bangla",
+            "bengali",
+            "bn",
+            "bn-in",
+            "bengali india",
+            "indian bengali" ->
+                bengali
+
+            "हिन्दी",
+            "hindi",
+            "hi",
+            "hi-in",
+            "hindi india" ->
+                hindi
+
+            else ->
+                english
+        }
+    }
+
+    private fun wakeResponse(): String {
+
+        return response(
+            "Yes, I am listening.",
+            "জি, আমি শুনছি।",
+            "जी, मैं सुन रहा हूँ।"
+        )
+    }
+
+    private fun emptyCommandResponse(): String {
+
+        return response(
+            "I did not hear a command.",
+            "আমি কোনো কমান্ড শুনতে পাইনি।",
+            "मैंने कोई कमांड नहीं सुनी।"
+        )
+    }
+
+    private fun hasWakeWord(
+        text: String
+    ): Boolean {
+
+        return com.ultra.assistant.voice
+            .WakeWordEngine
+            .detected(text)
+    }
+
+    private fun removeWakeWord(
+        text: String
+    ): String {
+
+        return com.ultra.assistant.voice
+            .WakeWordEngine
+            .strip(text)
+    }
+
+    private fun containsAny(
+        text: String,
+        vararg values: String
+    ): Boolean {
+
+        return values.any {
+            text.contains(
+                it,
+                ignoreCase = true
+            )
+        }
+    }
+
+    private fun urlEncode(
+        text: String
+    ): String {
+
+        return URLEncoder.encode(
+            text,
+            "UTF-8"
+        )
+    }
+
+    private fun stopCurrentRecognition() {
+
+        try {
+            speechRecognizer?.stopListening()
+        } catch (_: Exception) {
+        }
+
+        listening = false
+    }
+
+    private fun restartListening(
+        delay: Long
+    ) {
+
+        if (restarting) {
+            return
+        }
+
+        restarting = true
+
         handler.postDelayed({
-            restartQueued = false
-            if (!isListening) {
-                try { speech?.cancel() } catch (_: Exception) {}
-                beginListening()
+
+            restarting = false
+
+            if (!isDestroyed) {
+
+                if (speechRecognizer == null) {
+                    createSpeechRecognizer()
+                }
+
+                if (!listening && !processing) {
+                    startListening()
+                }
             }
+
         }, delay)
     }
 
-    override fun onDestroy() {
-        handler.removeCallbacksAndMessages(null)
-        try { speech?.cancel(); speech?.destroy() } catch (_: Exception) {}
-        speech = null
-        tts?.stop(); tts?.shutdown()
-        if (::dot.isInitialized) dot.hide()
-        isRunning = false
-        super.onDestroy()
+    private fun notifyVoiceState(
+        state: String
+    ) {
     }
-    override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun makeChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            val c = NotificationChannel("ultra_assistant", "ULTRA AI Assistant", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(c)
+    private fun notifyPartialText(
+        text: String
+    ) {
+    }
+
+    private fun createNotificationChannel() {
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
+            val channel =
+                NotificationChannel(
+                    "ultra_assistant",
+                    "ULTRA AI Assistant",
+                    NotificationManager.IMPORTANCE_LOW
+                )
+
+            getSystemService(
+                NotificationManager::class.java
+            ).createNotificationChannel(channel)
         }
     }
-    private fun makeNotification(): Notification {
-        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        return NotificationCompat.Builder(this, "ultra_assistant")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("ULTRA AI is listening")
-            .setContentText("Wake word: Hey Ultra • Tap to open")
-            .setContentIntent(pi).setOngoing(true).build()
+
+    private fun createNotification(): Notification {
+
+        val pendingIntent =
+            PendingIntent.getActivity(
+                this,
+                0,
+                Intent(
+                    this,
+                    MainActivity::class.java
+                ),
+                PendingIntent.FLAG_UPDATE_CURRENT or
+                    PendingIntent.FLAG_IMMUTABLE
+            )
+
+        return NotificationCompat.Builder(
+            this,
+            "ultra_assistant"
+        )
+            .setSmallIcon(
+                android.R.drawable.ic_btn_speak_now
+            )
+            .setContentTitle(
+                "ULTRA AI Assistant"
+            )
+            .setContentText(
+                "Voice assistant is active"
+            )
+            .setContentIntent(
+                pendingIntent
+            )
+            .setOngoing(true)
+            .build()
+    }
+
+    override fun onDestroy() {
+
+        handler.removeCallbacksAndMessages(null)
+
+        try {
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {
+        }
+
+        speechRecognizer = null
+
+        textToSpeech?.stop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
+
+        if (::floatingDot.isInitialized) {
+            floatingDot.hide()
+        }
+
+        listening = false
+        processing = false
+        restarting = false
+        isRunning = false
+
+        super.onDestroy()
+    }
+
+    override fun onBind(
+        intent: Intent?
+    ): IBinder? {
+        return null
     }
 }
 
-private fun String.hasWakeWord() = com.ultra.assistant.voice.WakeWordEngine.detected(this)
-private fun String.removeWake() = com.ultra.assistant.voice.WakeWordEngine.strip(this)
-private fun String.urlPart() = java.net.URLEncoder.encode(this, "UTF-8")
+private fun String.hasWakeWord(): Boolean {
+    return com.ultra.assistant.voice
+        .WakeWordEngine
+        .detected(this)
+}
+
+private fun String.removeWake(): String {
+    return com.ultra.assistant.voice
+        .WakeWordEngine
+        .strip(this)
+}
+
+private fun String.urlPart(): String {
+    return URLEncoder.encode(
+        this,
+        "UTF-8"
+    )
+}
