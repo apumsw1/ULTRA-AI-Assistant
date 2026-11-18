@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ResolveInfo
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -94,10 +95,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
         ttsReady = true
 
-        val locale =
-            selectedLocale()
-
-        tts?.language = locale
+        tts?.language = selectedLocale()
         tts?.setSpeechRate(0.96f)
         tts?.setPitch(1.0f)
     }
@@ -111,9 +109,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         recognizer?.destroy()
 
         recognizer =
-            SpeechRecognizer.createSpeechRecognizer(
-                this
-            )
+            SpeechRecognizer.createSpeechRecognizer(this)
 
         recognizer?.setRecognitionListener(
             object : RecognitionListener {
@@ -151,7 +147,6 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 ) {
 
                     listening = false
-
                     sendVoiceState("IDLE")
 
                     when (error) {
@@ -194,7 +189,6 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                     }
 
                     sendRecognizedText(text)
-
                     processCommand(text)
                 }
 
@@ -241,6 +235,9 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             setupRecognizer()
         }
 
+        val language =
+            selectedLanguageTag()
+
         val intent =
             Intent(
                 RecognizerIntent.ACTION_RECOGNIZE_SPEECH
@@ -253,12 +250,12 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE,
-                    selectedLanguageTag()
+                    language
                 )
 
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
-                    selectedLanguageTag()
+                    language
                 )
 
                 putExtra(
@@ -292,13 +289,11 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             recognizer?.startListening(intent)
 
             listening = true
-
             sendVoiceState("LISTENING")
 
         } catch (_: Exception) {
 
             listening = false
-
             restartListening(1200)
         }
     }
@@ -315,6 +310,14 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
+        val app =
+            findApplication(command)
+
+        if (app != null) {
+            openApplication(app)
+            return
+        }
+
         when {
 
             contains(
@@ -325,59 +328,9 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             ) -> {
 
                 speak(
-                    english = "Hello. I am listening.",
-                    bengali = "হ্যালো। আমি শুনছি।",
-                    hindi = "नमस्ते। मैं सुन रहा हूँ।"
-                )
-            }
-
-            contains(
-                command,
-                "open settings",
-                "settings",
-                "সেটিংস খোলো",
-                "সেটিংস",
-                "सेटिंग खोलो",
-                "सेटिंग"
-            ) -> {
-
-                openApplication(
-                    "com.android.settings",
-                    "Settings"
-                )
-            }
-
-            contains(
-                command,
-                "open chrome",
-                "chrome",
-                "ক্রোম খোলো",
-                "ক্রোম",
-                "क्रोम खोलो",
-                "क्रोम"
-            ) -> {
-
-                openApplication(
-                    "com.android.chrome",
-                    "Chrome"
-                )
-            }
-
-            contains(
-                command,
-                "open youtube",
-                "youtube",
-                "ইউটিউব খোলো",
-                "ইউটিউব",
-                "यूट्यूब खोलो",
-                "यूट्यूब"
-            ) -> {
-
-                openUrl(
-                    "https://www.youtube.com/",
-                    english = "Opening YouTube.",
-                    bengali = "YouTube খুলছি।",
-                    hindi = "YouTube खोल रहा हूँ।"
+                    "Hello. I am listening.",
+                    "হ্যালো। আমি শুনছি।",
+                    "नमस्ते। मैं सुन रहा हूँ।"
                 )
             }
 
@@ -390,98 +343,421 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 "खोजो"
             ) -> {
 
-                val url =
-                    "https://www.google.com/search?q=" +
-                        encode(command)
+                val query =
+                    removeSearchPrefix(command)
 
-                openUrl(
-                    url,
-                    english = "Searching.",
-                    bengali = "সার্চ করছি।",
-                    hindi = "सर्च कर रहा हूँ।"
-                )
+                searchWeb(query)
             }
 
             else -> {
 
+                speak(
+                    "I could not find an app with that name. I will search for it.",
+                    "এই নামে কোনো অ্যাপ খুঁজে পেলাম না। আমি এটি সার্চ করছি।",
+                    "इस नाम का कोई ऐप नहीं मिला। मैं इसे खोज रहा हूँ।"
+                )
+
                 val url =
                     "https://www.google.com/search?q=" +
                         encode(command)
 
-                openUrl(
-                    url,
-                    english = "I am searching for that.",
-                    bengali = "আমি এটা খুঁজে দেখছি।",
-                    hindi = "मैं इसे खोज रहा हूँ।"
-                )
+                openBrowserUrl(url)
             }
         }
     }
 
+    private fun findApplication(
+        command: String
+    ): ResolveInfo? {
+
+        val query =
+            cleanAppQuery(command)
+
+        if (query.isEmpty()) {
+            return null
+        }
+
+        val launcherIntent =
+            Intent(
+                Intent.ACTION_MAIN
+            ).apply {
+                addCategory(
+                    Intent.CATEGORY_LAUNCHER
+                )
+            }
+
+        val apps =
+            packageManager.queryIntentActivities(
+                launcherIntent,
+                0
+            )
+
+        if (apps.isEmpty()) {
+            return null
+        }
+
+        val normalizedQuery =
+            normalize(query)
+
+        var best:
+                ResolveInfo? = null
+
+        var bestScore = 0
+
+        for (app in apps) {
+
+            val label =
+                app.loadLabel(
+                    packageManager
+                )
+                    ?.toString()
+                    .orEmpty()
+
+            val packageName =
+                app.activityInfo?.packageName
+                    .orEmpty()
+
+            val activityName =
+                app.activityInfo?.name
+                    .orEmpty()
+
+            val normalizedLabel =
+                normalize(label)
+
+            val normalizedPackage =
+                normalize(packageName)
+
+            val normalizedActivity =
+                normalize(activityName)
+
+            var score = 0
+
+            if (
+                normalizedLabel ==
+                normalizedQuery
+            ) {
+                score = 1000
+            } else if (
+                normalizedLabel.startsWith(
+                    normalizedQuery
+                )
+            ) {
+                score = 850
+            } else if (
+                normalizedLabel.contains(
+                    normalizedQuery
+                )
+            ) {
+                score = 750
+            } else if (
+                normalizedQuery.contains(
+                    normalizedLabel
+                ) &&
+                normalizedLabel.length >= 3
+            ) {
+                score = 700
+            } else if (
+                normalizedPackage.contains(
+                    normalizedQuery
+                )
+            ) {
+                score = 500
+            } else if (
+                normalizedActivity.contains(
+                    normalizedQuery
+                )
+            ) {
+                score = 400
+            } else {
+
+                val queryWords =
+                    normalizedQuery
+                        .split(" ")
+                        .filter {
+                            it.length >= 2
+                        }
+
+                val labelWords =
+                    normalizedLabel
+                        .split(" ")
+                        .filter {
+                            it.length >= 2
+                        }
+
+                val matches =
+                    queryWords.count { word ->
+                        labelWords.any { labelWord ->
+                            labelWord == word ||
+                                labelWord.contains(word) ||
+                                word.contains(labelWord)
+                        }
+                    }
+
+                if (
+                    matches > 0 &&
+                    queryWords.isNotEmpty()
+                ) {
+                    score =
+                        300 +
+                            (
+                                matches * 100 /
+                                    queryWords.size
+                            )
+                }
+            }
+
+            if (score > bestScore) {
+                bestScore = score
+                best = app
+            }
+        }
+
+        return if (bestScore >= 300) {
+            best
+        } else {
+            null
+        }
+    }
+
+    private fun cleanAppQuery(
+        command: String
+    ): String {
+
+        var value =
+            command.trim()
+
+        val prefixes =
+            listOf(
+                "open ",
+                "launch ",
+                "start ",
+                "run ",
+                "open the app ",
+                "launch the app ",
+                "start the app ",
+                "খোলো ",
+                "খুলে দাও ",
+                "চালু কর ",
+                "অ্যাপ খোলো ",
+                "ऐप खोलो ",
+                "खोलो ",
+                "चालू करो ",
+                "ऐप खोलें "
+            )
+
+        var changed = true
+
+        while (
+            changed &&
+            value.isNotEmpty()
+        ) {
+
+            changed = false
+
+            for (prefix in prefixes) {
+
+                if (
+                    value.startsWith(
+                        prefix,
+                        ignoreCase = true
+                    )
+                ) {
+
+                    value =
+                        value
+                            .substring(
+                                prefix.length
+                            )
+                            .trim()
+
+                    changed = true
+                    break
+                }
+            }
+        }
+
+        val suffixes =
+            listOf(
+                " app",
+                " অ্যাপ",
+                " ऐप"
+            )
+
+        for (suffix in suffixes) {
+
+            if (
+                value.endsWith(
+                    suffix,
+                    ignoreCase = true
+                )
+            ) {
+
+                value =
+                    value
+                        .dropLast(
+                            suffix.length
+                        )
+                        .trim()
+
+                break
+            }
+        }
+
+        return value
+    }
+
+    private fun normalize(
+        value: String
+    ): String {
+
+        return value
+            .lowercase(Locale.ROOT)
+            .replace(
+                Regex("[^\\p{L}\\p{N}]+"),
+                " "
+            )
+            .trim()
+            .replace(
+                Regex("\\s+"),
+                " "
+            )
+    }
+
     private fun openApplication(
-        packageName: String,
-        name: String
+        info: ResolveInfo
     ) {
 
-        val intent =
-            packageManager.getLaunchIntentForPackage(
-                packageName
+        val activity =
+            info.activityInfo
+
+        val packageName =
+            activity?.packageName
+                .orEmpty()
+
+        val label =
+            info.loadLabel(
+                packageManager
             )
+                ?.toString()
+                .orEmpty()
 
-        if (intent == null) {
-
-            speak(
-                english = "$name is not available.",
-                bengali = "$name পাওয়া যাচ্ছে না।",
-                hindi = "$name उपलब्ध नहीं है।"
-            )
-
-            restartListening(1400)
-
+        if (
+            packageName.isEmpty() ||
+            activity == null
+        ) {
+            restartListening(500)
             return
         }
 
-        intent.addFlags(
-            Intent.FLAG_ACTIVITY_NEW_TASK
-        )
+        val intent =
+            Intent(
+                Intent.ACTION_MAIN
+            ).apply {
+
+                addCategory(
+                    Intent.CATEGORY_LAUNCHER
+                )
+
+                setClassName(
+                    packageName,
+                    activity.name
+                )
+
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                )
+            }
 
         try {
 
             startActivity(intent)
 
             speak(
-                english = "Opening $name.",
-                bengali = "$name খুলছি।",
-                hindi = "$name खोल रहा हूँ।"
+                "Opening $label.",
+                "$label খুলছি।",
+                "$label खोल रहा हूँ।"
             )
 
         } catch (_: Exception) {
 
             speak(
-                english = "I could not open $name.",
-                bengali = "$name খোলা যায়নি।",
-                hindi = "$name नहीं खुल सका।"
+                "I could not open $label.",
+                "$label খোলা যায়নি।",
+                "$label नहीं खुल सका।"
             )
         }
     }
 
-    private fun openUrl(
-        url: String,
-        english: String,
-        bengali: String,
-        hindi: String
+    private fun searchWeb(
+        query: String
+    ) {
+
+        val finalQuery =
+            query.ifBlank {
+                "search"
+            }
+
+        val url =
+            "https://www.google.com/search?q=" +
+                encode(finalQuery)
+
+        openBrowserUrl(url)
+
+        speak(
+            "Searching.",
+            "সার্চ করছি।",
+            "सर्च कर रहा हूँ।"
+        )
+    }
+
+    private fun removeSearchPrefix(
+        text: String
+    ): String {
+
+        val prefixes =
+            listOf(
+                "search for ",
+                "search ",
+                "সার্চ কর ",
+                "সার্চ ",
+                "খুঁজে দেখ ",
+                "सर्च करो ",
+                "सर्च ",
+                "खोजो "
+            )
+
+        for (prefix in prefixes) {
+
+            if (
+                text.startsWith(
+                    prefix,
+                    ignoreCase = true
+                )
+            ) {
+
+                return text
+                    .substring(
+                        prefix.length
+                    )
+                    .trim()
+            }
+        }
+
+        return text.trim()
+    }
+
+    private fun openBrowserUrl(
+        url: String
     ) {
 
         try {
 
             val intent =
                 Intent(
-                    Intent.ACTION_VIEW
+                    Intent.ACTION_VIEW,
+                    android.net.Uri.parse(url)
                 ).apply {
-
-                    data =
-                        android.net.Uri.parse(url)
-
                     addFlags(
                         Intent.FLAG_ACTIVITY_NEW_TASK
                     )
@@ -489,19 +765,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
             startActivity(intent)
 
-            speak(
-                english = english,
-                bengali = bengali,
-                hindi = hindi
-            )
-
         } catch (_: Exception) {
-
-            speak(
-                english = "I could not open it.",
-                bengali = "এটি খোলা যায়নি।",
-                hindi = "इसे खोला नहीं जा सका।"
-            )
         }
     }
 
@@ -512,18 +776,18 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     ) {
 
         if (!ttsReady) {
+            restartListening(700)
             return
         }
 
-        val language =
-            selectedLanguage()
+        val tag =
+            selectedLanguageTag()
 
-        tts?.language = language
+        tts?.language =
+            selectedLocale()
 
         val text =
-            when (
-                selectedLanguageTag()
-            ) {
+            when (tag) {
 
                 "bn-IN" ->
                     bengali
@@ -539,11 +803,14 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
         sendVoiceState("SPEAKING")
 
+        val utteranceId =
+            "ultra_${System.currentTimeMillis()}"
+
         tts?.speak(
             text,
             TextToSpeech.QUEUE_FLUSH,
             null,
-            "ultra_voice_${System.currentTimeMillis()}"
+            utteranceId
         )
 
         handler.postDelayed(
@@ -594,13 +861,22 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         ) {
 
             "hi-IN" ->
-                Locale("hi", "IN")
+                Locale(
+                    "hi",
+                    "IN"
+                )
 
             "bn-IN" ->
-                Locale("bn", "IN")
+                Locale(
+                    "bn",
+                    "IN"
+                )
 
             else ->
-                Locale("en", "IN")
+                Locale(
+                    "en",
+                    "IN"
+                )
         }
     }
 
@@ -622,10 +898,13 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 constructor.newInstance(this)
 
             val method =
-                clazz.getMethod("language")
+                clazz.getMethod(
+                    "language"
+                )
 
-            method.invoke(repository) as? String
-                ?: "english"
+            method.invoke(
+                repository
+            ) as? String ?: "english"
 
         } catch (_: Exception) {
 
@@ -660,7 +939,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         delay: Long
     ) {
 
-        if (restarting || isDestroyed) {
+        if (
+            restarting ||
+            isDestroyed
+        ) {
             return
         }
 
@@ -671,7 +953,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
                 restarting = false
 
-                if (!isDestroyed &&
+                if (
+                    !isDestroyed &&
                     !speaking &&
                     !listening
                 ) {
@@ -691,6 +974,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             Intent(
                 "com.ultra.assistant.VOICE_STATE"
             ).apply {
+
                 putExtra(
                     "state",
                     state
@@ -707,6 +991,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             Intent(
                 "com.ultra.assistant.VOICE_TEXT"
             ).apply {
+
                 putExtra(
                     "text",
                     text
@@ -723,6 +1008,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             Intent(
                 "com.ultra.assistant.VOICE_PARTIAL"
             ).apply {
+
                 putExtra(
                     "text",
                     text
@@ -739,6 +1025,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             Intent(
                 "com.ultra.assistant.VOICE_LEVEL"
             ).apply {
+
                 putExtra(
                     "level",
                     level
@@ -749,7 +1036,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     private fun createNotificationChannel() {
 
-        if (Build.VERSION.SDK_INT >=
+        if (
+            Build.VERSION.SDK_INT >=
             Build.VERSION_CODES.O
         ) {
 
@@ -760,12 +1048,9 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                     NotificationManager.IMPORTANCE_LOW
                 )
 
-            val manager =
-                getSystemService(
-                    NotificationManager::class.java
-                )
-
-            manager.createNotificationChannel(
+            getSystemService(
+                NotificationManager::class.java
+            ).createNotificationChannel(
                 channel
             )
         }
@@ -830,13 +1115,18 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         speaking = false
         isRunning = false
 
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopForeground(
+            STOP_FOREGROUND_REMOVE
+        )
+
         stopSelf()
     }
 
     override fun onDestroy() {
 
-        handler.removeCallbacksAndMessages(null)
+        handler.removeCallbacksAndMessages(
+            null
+        )
 
         try {
             recognizer?.cancel()
